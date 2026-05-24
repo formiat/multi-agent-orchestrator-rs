@@ -21,7 +21,11 @@ pub struct CodexSessionIndexRow {
 }
 
 /// Dispatch Codex in exec-resume mode.
-pub async fn dispatch(session_id: &str, repo: &Path) -> OrchestratorResult<DispatchedProcess> {
+pub async fn dispatch(
+    session_id: &str,
+    repo: &Path,
+    trigger_prompt: &str,
+) -> OrchestratorResult<DispatchedProcess> {
     let stdout_path = temp_log_path("codex_stdout");
     let stderr_path = temp_log_path("codex_stderr");
 
@@ -35,10 +39,11 @@ pub async fn dispatch(session_id: &str, repo: &Path) -> OrchestratorResult<Dispa
         "--json",
         "--dangerously-bypass-approvals-and-sandbox",
     ])
-    .args([session_id, crate::constants::TRIGGER_PROMPT])
+    .args([session_id, trigger_prompt])
     .current_dir(repo)
     .stdout(Stdio::from(stdout_file))
     .stderr(Stdio::from(stderr_file));
+    super::apply_agent_env(&mut cmd);
     super::apply_child_death_policy(&mut cmd);
     let child = cmd.spawn()?;
 
@@ -161,7 +166,7 @@ where
             continue;
         }
         // Filter by workspace directory and exclude dangling index rows with no
-        // resolvable session metadata (missing rollout/cwd).
+        // resolvable rollout/cwd data.
         let Some(cwd) = cwd_lookup(&row.id) else {
             continue;
         };

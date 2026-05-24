@@ -17,8 +17,7 @@ use crate::state::{AttemptState, ProbeSnapshot};
 ///   cannot be misclassified as FailedSilent before the grace window expires.
 /// - FailedSilent only fires when the process has exited AND provider activity is not
 ///   fresh; if provider is still fresh after exit, keep in WaitingOutput (early-exit rule).
-/// - HangConfirmed requires both conditions: work stale (A) AND provider log stale (B).
-///   Condition A alone advances to HangSuspected only.
+/// - HangConfirmed requires both conditions: work stale AND provider log stale.
 pub fn classify(snapshot: &ProbeSnapshot, now: DateTime<Utc>) -> AttemptState {
     // 1. Operator cancel
     if snapshot.cancelled {
@@ -88,7 +87,7 @@ pub fn classify(snapshot: &ProbeSnapshot, now: DateTime<Utc>) -> AttemptState {
         return AttemptState::FailedSilent;
     }
 
-    // 9. Hang confirmed — dual condition (work signals stale + provider log stale)
+    // 9. Hang confirmed — dual condition (work signals stale + provider log stale).
     if snapshot.hang_confirmed(now) {
         return AttemptState::HangConfirmed;
     }
@@ -98,12 +97,7 @@ pub fn classify(snapshot: &ProbeSnapshot, now: DateTime<Utc>) -> AttemptState {
         return AttemptState::HangConfirmed;
     }
 
-    // 10. Hang suspected (work signals only — provider not yet confirmed stale)
-    if snapshot.hang_suspected(now) {
-        return AttemptState::HangSuspected;
-    }
-
-    // 11. Finalizing: outbox is already written, wait for natural exit or forced stop.
+    // 10. Finalizing: outbox is already written, wait for natural exit or forced stop.
     if snapshot.process_alive && snapshot.outbox_present {
         return AttemptState::Finalizing;
     }
@@ -246,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_hang_confirmed_dual_condition() {
+    fn classify_waiting_output_when_work_stale_but_provider_fresh() {
         let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap(); // +1h, stale
 
@@ -262,7 +256,31 @@ mod tests {
             provider_activity_after_exit_is_fresh: false,
             work_signals_changed: false,
             last_work_signal_ts: Some(base), // stale
-            provider_stale: true,            // both conditions met
+            provider_stale: false,
+            grace_deadline: None,
+            hang_max_with_work_signals_exceeded: false,
+        };
+        assert_eq!(classify(&snap, now), AttemptState::WaitingOutput);
+    }
+
+    #[test]
+    fn classify_hang_confirmed_dual_condition() {
+        let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap();
+
+        let snap = ProbeSnapshot {
+            cancelled: false,
+            process_exited: false,
+            process_alive: true,
+            outbox_present: false,
+            provider_error: None,
+            success_contract: false,
+            soft_success_contract: false,
+            protocol_invalid: false,
+            provider_activity_after_exit_is_fresh: false,
+            work_signals_changed: false,
+            last_work_signal_ts: Some(base),
+            provider_stale: true,
             grace_deadline: None,
             hang_max_with_work_signals_exceeded: false,
         };
@@ -285,7 +303,7 @@ mod tests {
             protocol_invalid: false,
             provider_activity_after_exit_is_fresh: false,
             work_signals_changed: true,     // work signals still changing
-            last_work_signal_ts: Some(now), // recent → hang_suspected() returns false
+            last_work_signal_ts: Some(now), // recent → hang_confirmed() returns false
             provider_stale: true,           // provider log is stale
             grace_deadline: None,
             hang_max_with_work_signals_exceeded: true,

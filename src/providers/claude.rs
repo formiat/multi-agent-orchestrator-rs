@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -42,7 +43,11 @@ fn build_claude_ambiguity_reason(
 }
 
 /// Dispatch Claude in print mode (`-p`) resuming an existing session.
-pub async fn dispatch(session_id: &str, repo: &Path) -> OrchestratorResult<DispatchedProcess> {
+pub async fn dispatch(
+    session_id: &str,
+    repo: &Path,
+    trigger_prompt: &str,
+) -> OrchestratorResult<DispatchedProcess> {
     let stdout_path = temp_log_path("claude_stdout");
     let stderr_path = temp_log_path("claude_stderr");
 
@@ -56,11 +61,12 @@ pub async fn dispatch(session_id: &str, repo: &Path) -> OrchestratorResult<Dispa
         session_id,
         "--permission-mode",
         "bypassPermissions",
-        crate::constants::TRIGGER_PROMPT,
+        trigger_prompt,
     ])
     .current_dir(repo)
     .stdout(Stdio::from(stdout_file))
     .stderr(Stdio::from(stderr_file));
+    super::apply_agent_env(&mut cmd);
     super::apply_child_death_policy(&mut cmd);
     let child = cmd.spawn()?;
 
@@ -99,49 +105,23 @@ pub fn session_jsonl_mtime(
 }
 
 /// Maximum number of bytes read from the tail of the JSONL when scanning for stop signals.
-const MAX_JSONL_TAIL_BYTES: usize = 8192;
+const MAX_JSONL_TAIL_BYTES: usize = 65_536;
 
-/// Returns `true` when the Claude session JSONL tail contains a `max_tokens` stop reason.
-///
-/// `max_tokens` means the last API turn was cut off by context-window overflow. Retrying
-/// with the same session will hit the same limit; the run is classified as `ServiceCap`
-/// so the orchestrator stops instead of burning the consecutive-failure budget on retries.
-pub async fn session_jsonl_has_max_tokens(
-    repo: &Path,
-    session_id: &str,
-) -> OrchestratorResult<bool> {
-    let home = match std::env::var_os("HOME").map(std::path::PathBuf::from) {
-        Some(h) => h,
-        None => {
-            return Err(crate::errors::OrchestratorError::InvalidInput {
-                field: "HOME".to_owned(),
-                reason: "HOME environment variable is not set".to_owned(),
-            });
-        }
-    };
-    let key = claude_project_key(repo);
-    let log_path = home
-        .join(".claude")
-        .join("projects")
-        .join(&key)
-        .join(format!("{session_id}.jsonl"));
-    let tail = crate::signals::read_log_tail(&log_path, MAX_JSONL_TAIL_BYTES as u64).await?;
-    Ok(tail_has_max_tokens(&tail))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeJsonlServiceCapSignal {
+    pub pattern: &'static str,
+    pub fragment: String,
 }
 
-/// Returns `true` when the Claude session JSONL tail contains a service-cap / rate-limit error.
+/// Returns a service-cap signal from Claude JSONL entries written after this dispatch.
 ///
-/// Claude emits these as synthetic assistant API-error messages, for example:
-/// - `"error":"rate_limit"`
-/// - `"apiErrorStatus":429`
-/// - text: `"You've hit your limit ..."`
-///
-/// Retrying with the same session before reset is futile, so the run must be
-/// classified as `ServiceCap` rather than `FailedSilent`.
-pub async fn session_jsonl_has_rate_limit(
+/// This is safe to run while the Claude process is alive: incomplete JSONL records are ignored
+/// until a later probe sees the completed line.
+pub async fn session_jsonl_service_cap_since(
     repo: &Path,
     session_id: &str,
-) -> OrchestratorResult<bool> {
+    since: DateTime<Utc>,
+) -> OrchestratorResult<Option<ClaudeJsonlServiceCapSignal>> {
     let home = match std::env::var_os("HOME").map(std::path::PathBuf::from) {
         Some(h) => h,
         None => {
@@ -158,25 +138,94 @@ pub async fn session_jsonl_has_rate_limit(
         .join(&key)
         .join(format!("{session_id}.jsonl"));
     let tail = crate::signals::read_log_tail(&log_path, MAX_JSONL_TAIL_BYTES as u64).await?;
-    Ok(tail_has_rate_limit(&tail))
+    Ok(tail_service_cap_since(&tail, since))
 }
 
 /// Returns `true` when `tail` contains a `max_tokens` stop-reason field.
 ///
 /// The Anthropic API always emits `"stop_reason": "max_tokens"` (space after colon).
 /// The compact form is checked as a safety net.
+#[cfg(test)]
 fn tail_has_max_tokens(tail: &str) -> bool {
     tail.contains(r#""stop_reason": "max_tokens""#)
         || tail.contains(r#""stop_reason":"max_tokens""#)
 }
 
 /// Returns `true` when `tail` contains a rate-limit signal.
+#[cfg(test)]
 fn tail_has_rate_limit(tail: &str) -> bool {
     tail.contains(r#""error":"rate_limit""#)
         || tail.contains(r#""error": "rate_limit""#)
         || tail.contains(r#""apiErrorStatus":429"#)
         || tail.contains(r#""apiErrorStatus": 429"#)
         || tail.contains("You've hit your limit")
+}
+
+fn tail_service_cap_since(tail: &str, since: DateTime<Utc>) -> Option<ClaudeJsonlServiceCapSignal> {
+    for line in tail.lines().rev() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(timestamp) = value
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+            .map(|ts| ts.with_timezone(&Utc))
+        else {
+            continue;
+        };
+        if timestamp < since {
+            continue;
+        }
+
+        if value
+            .pointer("/message/stop_reason")
+            .and_then(serde_json::Value::as_str)
+            == Some("max_tokens")
+        {
+            return Some(ClaudeJsonlServiceCapSignal {
+                pattern: "claude_jsonl_max_tokens_since_dispatch",
+                fragment: "max_tokens".to_owned(),
+            });
+        }
+
+        if value.get("error").and_then(serde_json::Value::as_str) == Some("rate_limit") {
+            return Some(ClaudeJsonlServiceCapSignal {
+                pattern: "claude_jsonl_rate_limit_since_dispatch",
+                fragment: "rate_limit".to_owned(),
+            });
+        }
+
+        if value
+            .get("apiErrorStatus")
+            .and_then(serde_json::Value::as_u64)
+            == Some(429)
+        {
+            return Some(ClaudeJsonlServiceCapSignal {
+                pattern: "claude_jsonl_api_429_since_dispatch",
+                fragment: "apiErrorStatus=429".to_owned(),
+            });
+        }
+
+        if value
+            .get("isApiErrorMessage")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            let serialized = serde_json::to_string(&value).unwrap_or_default();
+            if crate::signals::classify_provider_error_with_match(&serialized)
+                .map(|m| matches!(m.class, crate::state::ProviderErrorClass::ServiceCap))
+                .unwrap_or(false)
+            {
+                return Some(ClaudeJsonlServiceCapSignal {
+                    pattern: "claude_jsonl_api_error_text_since_dispatch",
+                    fragment: "isApiErrorMessage service cap".to_owned(),
+                });
+            }
+        }
+    }
+
+    None
 }
 
 /// Discover a Claude session UUID by thread name from project JSONL logs.
@@ -438,6 +487,40 @@ mod tests {
         let tail = r#"{"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429}"#;
         assert!(tail_has_rate_limit(tail));
         assert!(tail_has_rate_limit("You've hit your limit · resets 2:10pm"));
+    }
+
+    #[test]
+    fn jsonl_tail_detects_fresh_rate_limit_since_dispatch() {
+        let since = DateTime::parse_from_rfc3339("2026-05-24T16:25:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let tail = r#"{"timestamp":"2026-05-24T16:25:38.097Z","type":"assistant","message":{"content":[{"type":"text","text":"You've hit your session limit · resets 2:30pm"}],"stop_reason":"stop_sequence"},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429}"#;
+
+        let signal = tail_service_cap_since(tail, since).unwrap();
+        assert_eq!(signal.pattern, "claude_jsonl_rate_limit_since_dispatch");
+        assert_eq!(signal.fragment, "rate_limit");
+    }
+
+    #[test]
+    fn jsonl_tail_ignores_old_rate_limit_before_dispatch() {
+        let since = DateTime::parse_from_rfc3339("2026-05-24T16:26:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let tail = r#"{"timestamp":"2026-05-24T16:25:38.097Z","type":"assistant","message":{"content":[{"type":"text","text":"You've hit your session limit · resets 2:30pm"}],"stop_reason":"stop_sequence"},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429}"#;
+
+        assert!(tail_service_cap_since(tail, since).is_none());
+    }
+
+    #[test]
+    fn jsonl_tail_detects_fresh_max_tokens_since_dispatch() {
+        let since = DateTime::parse_from_rfc3339("2026-05-24T16:25:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let tail = r#"{"timestamp":"2026-05-24T16:25:38.097Z","type":"assistant","message":{"stop_reason":"max_tokens"}}"#;
+
+        let signal = tail_service_cap_since(tail, since).unwrap();
+        assert_eq!(signal.pattern, "claude_jsonl_max_tokens_since_dispatch");
+        assert_eq!(signal.fragment, "max_tokens");
     }
 
     #[test]

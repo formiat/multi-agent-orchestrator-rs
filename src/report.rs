@@ -86,12 +86,14 @@ pub struct FinalReport {
     pub executor_provider: Option<ProviderKind>,
     pub executor_session_id: Option<String>,
     pub executor_thread_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executor_model: Option<String>,
     pub reviewer_provider: Option<ProviderKind>,
     pub reviewer_session_id: Option<String>,
     pub reviewer_thread_name: String,
-
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata_commit_hash: Option<String>,
+    pub reviewer_model: Option<String>,
+
     pub consecutive_failure_count: u32,
 
     #[serde(skip_serializing_if = "Option::is_none")]

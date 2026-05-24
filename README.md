@@ -8,20 +8,20 @@ Runs a structured workflow where an executor agent (Claude, OpenCode, or Codex) 
 
 Three workflow types:
 
-- **plan** — produce `PLAN.md` with implementation plan
-- **investigate** — produce `INVESTIGATION.md` with root cause and fix direction
-- **implement** — executor attempts implementation; reviewer verifies commits, worktree state, tests, and accepts or rejects the result via strict YAML
+- **investigate** — input: user prompt; output: `INVESTIGATION.md` with evidence-backed research findings and conclusions
+- **plan** — input: user prompt plus optional `INVESTIGATION.md`; output: `PLAN.md` with implementation plan and automated test strategy
+- **implement** — input: user prompt plus optional `PLAN.md`; output: local commit(s) with implementation and test changes
 
-The loop runs until the reviewer accepts (`quality_score ≥ 8`), a hard stop condition is reached, or the operator cancels.
+The loop runs until the reviewer returns `decision: accept` with `quality_score >= 8`, a hard stop condition is reached, or the operator cancels.
 
 ## Prerequisites
 
 - Rust (stable)
 - Provider CLIs installed and authenticated for each provider you intend to use as executor or reviewer: `claude`, `opencode`, and/or `codex`
-- Two pre-existing provider sessions — one for executor, one for reviewer. Each session must have a title (thread name) that the orchestrator uses to discover it. Executor and reviewer may use the same or different providers, but must not share the same `(provider, thread_name)` pair.
+- Two pre-existing provider sessions — one for executor, one for reviewer. Each session must have a discoverable title/thread name. Executor and reviewer may use the same or different providers, but they must resolve to distinct `(provider, session_id)` bindings.
 - A **clean git worktree** in the target repository. The orchestrator aborts immediately if `git status` shows any uncommitted changes.
 
-The orchestrator does not create sessions. It discovers existing ones by thread name at startup.
+The orchestrator never creates provider sessions or chats. It deterministically discovers existing sessions at startup and stops with `failed_session_bind` if binding is missing, ambiguous, or resolves executor and reviewer to the same provider session.
 
 ## Build
 
@@ -41,14 +41,26 @@ orchestrate \
   --reviewer-thread-name <session-title> \
   --prompt <task-description> \
   --notion-policy <required|optional> \
+  --remote-network-policy <forbidden|read_only|operational> \
   --executor-provider <claude|opencode|codex> \
-  --reviewer-provider <claude|opencode|codex>
+  --reviewer-provider <claude|opencode|codex> \
+  [--executor-model <provider/model>] \
+  [--reviewer-model <provider/model>]
 ```
 
 Both provider flags are required. There are no default providers because provider choice controls session discovery and execution semantics.
 `--notion-policy` defaults to `optional`.
+`--remote-network-policy` defaults to `forbidden`.
+`--executor-model` and `--reviewer-model` are optional OpenCode-only overrides. When provided, the orchestrator validates the model at startup with `opencode models <provider>` and passes it to `opencode run --model <provider/model>`.
 
 Notion behavior is defined by [`docs/notion_access_protocol.md`](docs/notion_access_protocol.md).
+GitLab read-only access behavior is defined by [`docs/gitlab_access_protocol.md`](docs/gitlab_access_protocol.md).
+
+Remote network policy controls what the agents are allowed to do against remote target systems:
+
+- `forbidden` — default; SSH and HTTP requests to remote target systems are forbidden.
+- `read_only` — SSH/HTTP access is allowed only for immutable investigation actions; mutating commands, state changes, service restarts, DB writes, and unpacking remote log archives are forbidden.
+- `operational` — explicitly allows limited operational actions on the user-specified remote target system, while still forbidding DB writes, OS/system-level destructive changes, actions outside the target system, and unpacking remote log archives.
 
 **Example — different providers, same thread name:**
 
@@ -78,7 +90,7 @@ orchestrate \
   --reviewer-provider claude
 ```
 
-Executor and reviewer must not share the same `(provider, thread_name)` pair. Output is always JSON on stdout; logs go to stderr.
+Executor and reviewer must resolve to distinct `(provider, session_id)` bindings. Reusing the same thread name is valid across different providers, but same-provider roles should use separate sessions. Output is always JSON on stdout; logs go to stderr.
 
 **Exit codes:** `0` on `done_quality_reached`; `1` on any other terminal state.
 
@@ -102,13 +114,14 @@ Each snapshot contains `role`, `provider`, `session_id`, `path`, `sha256`, `byte
   "workspace_root": "/home/user/projects/myapp",
   "branch": "feature/pagination",
   "notion_policy": "optional",
+  "remote_network_policy": "forbidden",
   "executor_provider": "opencode",
   "executor_session_id": "sess_abc123",
   "executor_thread_name": "TASK-42 add pagination",
+  "executor_model": "deepseek/deepseek-v4-flash",
   "reviewer_provider": "codex",
   "reviewer_session_id": "sess_def456",
   "reviewer_thread_name": "TASK-42 add pagination",
-  "metadata_commit_hash": "0f1e2d3c4b5a",
   "consecutive_failure_count": 0,
   "quality_score": 9,
   "reviewer_decision": "accept",
@@ -182,7 +195,7 @@ Each snapshot contains `role`, `provider`, `session_id`, `path`, `sha256`, `byte
     "lines": 48,
     "utf8_lossy": false,
     "mtime": "2026-05-01T12:03:00Z",
-    "body": "role: reviewer\nworkflow_type: implement\n..."
+    "body": "quality_score: 9\ndecision: accept\nrationale: Implementation is complete and correct.\ncontract_satisfied: true\n..."
   }
 }
 ```
@@ -212,15 +225,23 @@ CONTEXT_PREP → SESSION_BIND → EXECUTOR_DISPATCH ←────────�
                           └─ irreconcilable_disagreement / poisoned_session → terminal
 ```
 
-**Transport:** executor and reviewer communicate via `.agent-io/inbox.txt` (prompt) and `.agent-io/outbox.txt` (result). These files are never committed. On first run, `.agent-io/` is automatically added to `.git/info/exclude` so transport files never appear as untracked. The monitor uses executor outbox metadata only (existence/size/mtime) for orchestration decisions. After executor completion, the orchestrator may read the raw executor outbox body only to log it and include it in the final JSON report; it must not parse, grep, classify, summarize, semantically inspect, or route based on that body. The reviewer is the only semantic consumer of executor outbox. The reviewer reads executor outbox directly and overwrites it with a YAML verdict.
+**Transport:** executor and reviewer communicate via `.agent-io/inbox.txt` (prompt) and `.agent-io/outbox.txt` (result) inside `--workspace-root`. These files are never committed. On first run, `.agent-io/` is automatically added to `.git/info/exclude` so transport files never appear as untracked. Provider trigger prompts and generated agent prompts use absolute `inbox_path`/`outbox_path` to prevent agents from resolving `.agent-io` relative to the orchestrator repository. The monitor uses outbox metadata only (existence/size/mtime) for orchestration decisions. After executor completion, the orchestrator may read the raw executor outbox body only to log it and include it in the final JSON report; it must not parse, grep, classify, summarize, semantically inspect, or route based on that body. The reviewer is the only semantic consumer of executor outbox. The reviewer reads executor outbox directly and overwrites it with a YAML verdict.
 
-**Hang detection:** dual-condition — work signals absent ≥ 300 s AND provider log stale ≥ 300 s. One stale condition alone only advances to `HangSuspected`. After `HangConfirmed` the attempt is killed, retried, and the consecutive failure counter increments. Provider signal read failures (permission errors, malformed provider CLI output, failed provider signal commands) are fatal orchestration errors rather than ignored monitoring gaps.
+**Monitoring cadence:** the monitor probes local process/file/provider signals every 1 s and emits a heartbeat every 300 s. Heartbeats include `phase_hint`, changed-file count, hot files, provider staleness, and the last detected provider command when available.
+
+**Hang detection:** dual-condition — work signals absent ≥ 420 s AND provider log stale ≥ 420 s advances to `HangConfirmed`. A live attempt with continuing work signals but no result has a 2400 s hard ceiling before provider-log confirmation is required. After `HangConfirmed` the attempt is killed, retried, and the consecutive failure counter increments. Provider signal read failures (permission errors, malformed provider CLI output, failed provider signal commands) are fatal orchestration errors rather than ignored monitoring gaps.
+
+**Finalizing:** when a non-empty outbox written after the current dispatch is detected while the provider process is still alive, the attempt enters `Finalizing`. If the process has not exited 60 s after that outbox mtime, the orchestrator force-stops it so the run can proceed to output collection.
 
 **Retries:** only infra failures count (crashes, silent exits, hangs). Reviewer `revise` is a successful semantic round and resets the counter. The revise loop is intentionally unbounded — the reviewer decides when to return `accept` or `blocked`.
 
 Reviewer retries are intentionally allowed even when the reviewer already modified `.agent-io/outbox.txt`. This relies on persistent provider sessions: if the reviewer cleared or overwrote outbox, it is assumed to have already read the executor result and to retain that context in its session. A retried reviewer batch request is therefore expected to continue in the same reviewer session, not replay from a stateless process snapshot. If the provider loses that context, retries may fail again and eventually stop at the consecutive failure limit.
 
 **Session locking:** a file lock keyed by `(provider, session_id)` prevents two orchestrator processes from dispatching to the same session simultaneously.
+
+**Agent run limits:** the orchestrator performs a `runlim` preflight (`command -v runlim` via shell `PATH`, plus an interactive-bash probe for `~/.bashrc`-provided commands), accepts only an absolute executable file path, logs the resolved source path, and injects that absolute path into normal executor/reviewer prompts for `cargo run`/`cargo test` examples. Reviewer YAML-repair prompts do not include this hint. Provider dispatch env also enriches `PATH` with `~/.local/bin` and `/usr/local/bin` so non-interactive agent subprocesses can resolve `runlim` more reliably.
+
+**Agent test hygiene:** provider processes are dispatched with `PROPTEST_DISABLE_FAILURE_PERSISTENCE=1` so agent-run `cargo test` commands do not create `*.proptest-regressions` files in the target workspace. Normal executor/reviewer prompts also explicitly tell agents to use `PROPTEST_DISABLE_FAILURE_PERSISTENCE=1 cargo test ...` and not to leave or commit proptest regression files.
 
 ## Logging
 
@@ -233,11 +254,14 @@ RUST_LOG=debug orchestrate ...
 At `info` level the orchestrator logs:
 
 - context prep facts: workspace root, workflow, branch, initial HEAD, Claude project key when relevant;
-- session binding facts: executor/reviewer provider and session ID;
+- fresh session discovery facts: executor/reviewer provider and session ID;
 - every generated inbox prompt, including path, size, line count, SHA-256, mtime, UTF-8 lossiness, and full body;
 - executor outbox raw diagnostic snapshot after executor completion, with the same metadata and full body;
 - reviewer outbox raw YAML snapshot after reviewer completion, with the same metadata and full body;
 - dispatch facts: role, provider, session ID, fixed template, request SHA-256, child PID;
+- git deltas while an agent is working, including newly changed/resolved status lines and top hot files;
+- heartbeat context: phase hint, changed-file count, hot files, provider staleness, and last signal age;
+- provider action tail when detected from provider diagnostics, for example long-running `cargo test`, `cargo clippy`, `make`, `rg`, or shell commands;
 - quality gate decisions and retry/failure transitions.
 
 Provider stdout/stderr tails and provider session logs are orchestration diagnostics and may be inspected for provider/service errors. Executor outbox body is logged as an opaque blob only; it is never parsed or used for control flow.
@@ -277,7 +301,7 @@ Strict rules:
 
 ## Session setup
 
-> **Warning:** the orchestrator may write and commit `ORCHESTRATOR_SESSIONS.json` in the target workspace when session binding scope changes (workspace/provider/thread-name changes) or when metadata is absent. Ensure pre-commit hooks are non-blocking and that you have write access.
+The orchestrator does not persist session bindings. Every run performs fresh deterministic discovery from provider state using `--workspace-root`, provider, and thread name.
 
 Before the first run, create two sessions in your provider(s) and give each a title that matches the thread name you will pass on the CLI.
 
@@ -289,9 +313,44 @@ The orchestrator discovers Claude sessions from `~/.claude/projects/<project-key
 
 The orchestrator discovers OpenCode sessions via `opencode session list --format json`, filtering by `directory == workspace-root` and `title == thread-name`. Create a session inside the target workspace directory and set its title accordingly.
 
+OpenCode dispatch automatically uses a user `systemd-run` scope when available. Before dispatch, the orchestrator probes `systemd-run --user --scope --collect --same-dir --quiet ... true`; if it succeeds, OpenCode is launched as:
+
+```bash
+systemd-run --user --scope --collect --same-dir --quiet \
+  -p MemoryHigh=18G \
+  -p MemoryMax=20G \
+  -p MemorySwapMax=2G \
+  opencode run ...
+```
+
+If the probe fails, OpenCode is launched directly as `opencode run ...`.
+
+Optional OpenCode model overrides use OpenCode's canonical `provider/model` format:
+
+```bash
+orchestrate \
+  --workflow plan \
+  --workspace-root /home/user/projects/myapp \
+  --executor-thread-name "TASK-42 executor" \
+  --reviewer-thread-name "TASK-42 reviewer" \
+  --prompt "Plan the fix" \
+  --executor-provider opencode \
+  --reviewer-provider opencode \
+  --executor-model deepseek/deepseek-v4-flash \
+  --reviewer-model zai/glm-4.7
+```
+
+Before dispatch, each supplied model is validated against the local OpenCode model list. If `zai/glm-4.7` is supplied, the validation command is equivalent to:
+
+```bash
+opencode models zai
+```
+
+The run fails with `failed_invalid_input` if the model is not listed or if a model override is used with a non-OpenCode provider.
+
 **Codex**
 
-The orchestrator discovers Codex sessions from `~/.codex/session_index.jsonl` by matching `thread_name` and filtering candidates to sessions whose recorded cwd equals `--workspace-root`. Create a named Codex session/thread from inside the target workspace directory whose `thread_name` matches the CLI thread name.
+The orchestrator discovers Codex sessions from `~/.codex/session_index.jsonl` by matching the latest `thread_name` row per session ID and filtering candidates to sessions whose rollout metadata records `cwd == --workspace-root`. Dangling index rows without resolvable cwd metadata are ignored. Create a named Codex session/thread from inside the target workspace directory whose `thread_name` matches the CLI thread name.
 
 **Example — Claude executor + Codex reviewer, same thread name:**
 
@@ -332,6 +391,7 @@ orchestrate \
 - **Hang detection requires readable provider signals.** Missing provider session logs are treated as absent activity signals, but provider signal read failures are fatal orchestration errors. Examples include permission errors on local provider logs, malformed provider CLI JSON, or failed provider signal commands.
 - **Worktree must be clean at start.** The orchestrator rejects dirty worktrees at `CONTEXT_PREP`. Stage or stash any in-progress changes before running.
 - **Sessions must already exist.** The orchestrator never creates sessions. A missing or ambiguously named session fails at `SESSION_BIND` with `failed_session_bind`.
+- **Executor and reviewer sessions must be distinct.** If both roles resolve to the same `(provider, session_id)`, the run fails at `SESSION_BIND` instead of risking mixed executor/reviewer context.
 
 ## Development
 

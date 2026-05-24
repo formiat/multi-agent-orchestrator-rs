@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use std::time::SystemTime;
 
-use crate::constants::HANG_SUSPECT_SEC;
+use crate::constants::HANG_CONFIRM_SEC;
 
 // ---------------------------------------------------------------------------
 // Core enumerations
@@ -66,12 +66,11 @@ impl std::str::FromStr for ProviderKind {
 ///   6 SoftSuccess
 ///   7 FailedProtocol     — only after final-result boundary
 ///   8 FailedSilent       — process exited, no output, no fresh provider activity
-///   9 HangConfirmed      — dual condition: work stale AND provider log stale
-///  10 HangSuspected      — work stale only
-///  11 Finalizing         — outbox is non-empty, waiting for process exit/forced stop
-///  12 Running            — any work signal changed since last probe
-///  13 WaitingOutput      — alive, no new signals
-///  14 Dispatching / Unknown — fallback
+///   9 HangConfirmed      — work stale AND provider log stale
+///  10 Finalizing         — outbox is non-empty, waiting for process exit/forced stop
+///  11 Running            — any work signal changed since last probe
+///  12 WaitingOutput      — alive, no new signals
+///  13 Dispatching / Unknown — fallback
 ///
 /// TerminatingStale, RetryPending, RetryExhausted are **not** classifier outputs;
 /// they are assigned by routing logic after the classifier returns HangConfirmed
@@ -98,9 +97,7 @@ pub enum AttemptState {
     FailedTransport,
     /// Required artifact invalid, malformed, or empty after final-result boundary.
     FailedProtocol,
-    /// Work signals absent ≥ HANG_SUSPECT_SEC; provider log not yet confirmed stale.
-    HangSuspected,
-    /// Dual condition: work signals stale AND provider log stale ≥ HANG_CONFIRM_SEC.
+    /// Work signals stale AND provider log stale ≥ HANG_CONFIRM_SEC.
     HangConfirmed,
     /// Outbox is already non-empty; waiting for process natural exit or forced stop timeout.
     Finalizing,
@@ -228,19 +225,21 @@ impl NotionPolicy {
     }
 }
 
-/// Policy for remote network actions against external production systems.
+/// Policy for remote network actions against remote target systems.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteNetworkPolicy {
     Forbidden,
-    Allowed,
+    ReadOnly,
+    Operational,
 }
 
 impl RemoteNetworkPolicy {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Forbidden => "forbidden",
-            Self::Allowed => "allowed",
+            Self::ReadOnly => "read_only",
+            Self::Operational => "operational",
         }
     }
 }
@@ -256,9 +255,10 @@ impl std::str::FromStr for RemoteNetworkPolicy {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "forbidden" => Ok(Self::Forbidden),
-            "allowed" => Ok(Self::Allowed),
+            "read_only" => Ok(Self::ReadOnly),
+            "operational" => Ok(Self::Operational),
             other => Err(format!(
-                "unknown remote network policy '{other}'; expected forbidden|allowed"
+                "unknown remote network policy '{other}'; expected forbidden|read_only|operational"
             )),
         }
     }
@@ -416,8 +416,8 @@ pub struct ProbeSnapshot {
     /// Provider session log has not been updated within `HANG_CONFIRM_SEC` (condition B).
     ///
     /// Computed inline each cycle as `provider_log_mtime.elapsed() >= HANG_CONFIRM_SEC`.
-    /// Together with `hang_suspected()` (condition A) this forms the dual-condition
-    /// hang confirmation that prevents false positives from server-side activity.
+    /// Used together with work-signal staleness to prevent false positives from
+    /// local silence while the provider is still active server-side.
     pub provider_stale: bool,
     /// Active grace deadline copied from `AttemptStateData` for this probe cycle.
     pub grace_deadline: Option<DateTime<Utc>>,
@@ -426,18 +426,14 @@ pub struct ProbeSnapshot {
 }
 
 impl ProbeSnapshot {
-    /// Condition A: process alive and work signals stale beyond `HANG_SUSPECT_SEC`.
-    pub fn hang_suspected(&self, now: DateTime<Utc>) -> bool {
+    /// True when the provider is alive but both local work signals and provider log are stale.
+    pub fn hang_confirmed(&self, now: DateTime<Utc>) -> bool {
         self.process_alive
             && self
                 .last_work_signal_ts
-                .map(|t| (now - t).num_seconds().max(0) as u64 >= HANG_SUSPECT_SEC)
+                .map(|t| (now - t).num_seconds().max(0) as u64 >= HANG_CONFIRM_SEC)
                 .unwrap_or(false)
-    }
-
-    /// Dual condition: work signals stale (condition A) AND provider log stale (condition B).
-    pub fn hang_confirmed(&self, now: DateTime<Utc>) -> bool {
-        self.hang_suspected(now) && self.provider_stale
+            && self.provider_stale
     }
 
     /// True when the attempt has definitively passed the point where more output can arrive.
@@ -500,6 +496,10 @@ pub struct ProbeSignals {
 pub struct TemplateValues {
     pub workflow_type: WorkflowType,
     pub workspace_root: String,
+    pub transport_dir: String,
+    pub inbox_path: String,
+    pub outbox_path: String,
+    pub orchestrator_docs_dir: String,
     pub branch: String,
     pub user_prompt: String,
     pub notion_policy: NotionPolicy,
@@ -516,6 +516,8 @@ pub struct TemplateValues {
     pub review_result_yaml: Option<String>,
     /// Numbered feedback items for the executor (feedback template only).
     pub feedback_for_executor: Option<String>,
+    /// Optional executor-only local run wrapper instruction.
+    pub runlim_rule: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -551,25 +553,42 @@ mod tests {
     }
 
     #[test]
-    fn hang_suspected_requires_alive_and_stale() {
-        let now = Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap(); // +1h
-        let stale_ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(); // 3600s ago
-
-        let snap = make_snapshot(true, Some(stale_ts), false);
-        assert!(snap.hang_suspected(now));
-
-        // Dead process should not be suspected
-        let snap_dead = make_snapshot(false, Some(stale_ts), false);
-        assert!(!snap_dead.hang_suspected(now));
+    fn remote_network_policy_parses_supported_modes_only() {
+        assert_eq!(
+            "forbidden".parse::<RemoteNetworkPolicy>().unwrap(),
+            RemoteNetworkPolicy::Forbidden
+        );
+        assert_eq!(
+            "read_only".parse::<RemoteNetworkPolicy>().unwrap(),
+            RemoteNetworkPolicy::ReadOnly
+        );
+        assert_eq!(
+            "operational".parse::<RemoteNetworkPolicy>().unwrap(),
+            RemoteNetworkPolicy::Operational
+        );
+        assert!("allowed".parse::<RemoteNetworkPolicy>().is_err());
     }
 
     #[test]
-    fn hang_not_suspected_when_fresh() {
+    fn hang_confirmed_requires_alive_and_stale() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap(); // +1h
+        let stale_ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(); // 3600s ago
+
+        let snap = make_snapshot(true, Some(stale_ts), true);
+        assert!(snap.hang_confirmed(now));
+
+        // Dead process should not be confirmed as a hang.
+        let snap_dead = make_snapshot(false, Some(stale_ts), false);
+        assert!(!snap_dead.hang_confirmed(now));
+    }
+
+    #[test]
+    fn hang_not_confirmed_when_fresh() {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 4, 0).unwrap(); // +4 min
         let fresh_ts = Utc.with_ymd_and_hms(2026, 1, 1, 0, 3, 0).unwrap(); // 1 min ago
 
-        let snap = make_snapshot(true, Some(fresh_ts), false);
-        assert!(!snap.hang_suspected(now));
+        let snap = make_snapshot(true, Some(fresh_ts), true);
+        assert!(!snap.hang_confirmed(now));
     }
 
     #[test]
@@ -581,7 +600,6 @@ mod tests {
         let snap_provider_fresh = make_snapshot(true, Some(stale_ts), false);
         assert!(!snap_provider_fresh.hang_confirmed(now));
 
-        // Both stale → confirmed
         let snap_confirmed = make_snapshot(true, Some(stale_ts), true);
         assert!(snap_confirmed.hang_confirmed(now));
     }

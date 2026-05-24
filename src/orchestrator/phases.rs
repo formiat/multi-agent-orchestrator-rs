@@ -1,13 +1,11 @@
 use chrono::{DateTime, Utc};
+use std::time::Duration;
 
 use crate::constants::{CONSECUTIVE_FAILURE_LIMIT, PHASE_SEPARATOR_WAIT_SEC};
 use crate::errors::{OrchestratorError, OrchestratorResult};
 use crate::providers::dispatch;
 use crate::report::TransportBodyReport;
-use crate::sessions::{
-    claude_project_key, load_session_metadata, run_git, validate_session_metadata,
-    write_and_commit_session_metadata, RoleSessionRecord, SessionMetadata,
-};
+use crate::sessions::{claude_project_key, run_git};
 use crate::signals::format_git_facts;
 use crate::state::{
     AgentRole, AttemptState, AttemptStateData, NotionPolicy, ProviderKind, RunState, TemplateId,
@@ -44,6 +42,16 @@ pub(super) fn validate_inputs(ctx: &mut OrchestratorCtx) -> OrchestratorResult<(
             reason: "must be non-empty".to_owned(),
         });
     }
+    validate_model_option(
+        "--executor-model",
+        ctx.args.executor_model.as_deref(),
+        ctx.args.executor_provider,
+    )?;
+    validate_model_option(
+        "--reviewer-model",
+        ctx.args.reviewer_model.as_deref(),
+        ctx.args.reviewer_provider,
+    )?;
     // Executor and reviewer must not share the same (provider, thread_name) pair —
     // that would bind them to the same session and mix their contexts.
     if ctx.args.executor_provider == ctx.args.reviewer_provider
@@ -71,6 +79,49 @@ pub(super) fn validate_inputs(ctx: &mut OrchestratorCtx) -> OrchestratorResult<(
             field: "--workspace-root".to_owned(),
             reason: "must be a directory".to_owned(),
         });
+    }
+    Ok(())
+}
+
+fn validate_model_option(
+    field: &str,
+    model: Option<&str>,
+    provider: ProviderKind,
+) -> OrchestratorResult<()> {
+    let Some(model) = model else {
+        return Ok(());
+    };
+    if model.trim().is_empty() {
+        return Err(OrchestratorError::InvalidInput {
+            field: field.to_owned(),
+            reason: "must be non-empty when provided".to_owned(),
+        });
+    }
+    if provider != ProviderKind::Opencode {
+        return Err(OrchestratorError::InvalidInput {
+            field: field.to_owned(),
+            reason: format!(
+                "model override is currently supported only for opencode, got {provider}"
+            ),
+        });
+    }
+    crate::providers::opencode::parse_model_provider(model).map_err(|reason| {
+        OrchestratorError::InvalidInput {
+            field: field.to_owned(),
+            reason,
+        }
+    })?;
+    Ok(())
+}
+
+pub(super) async fn validate_provider_models(ctx: &OrchestratorCtx) -> OrchestratorResult<()> {
+    if let Some(model) = ctx.args.executor_model.as_deref() {
+        crate::providers::opencode::ensure_model_available(ctx.repo(), model, "--executor-model")
+            .await?;
+    }
+    if let Some(model) = ctx.args.reviewer_model.as_deref() {
+        crate::providers::opencode::ensure_model_available(ctx.repo(), model, "--reviewer-model")
+            .await?;
     }
     Ok(())
 }
@@ -143,38 +194,6 @@ pub(super) async fn do_session_bind(ctx: &mut OrchestratorCtx) -> OrchestratorRe
     let repo = ctx.args.workspace_root.clone();
     let executor_thread_name = ctx.args.executor_thread_name.clone();
     let reviewer_thread_name = ctx.args.reviewer_thread_name.clone();
-    let workspace_root = repo.to_string_lossy().into_owned();
-
-    if let Some(meta) = load_session_metadata(&repo, ctx.args.executor_provider).await? {
-        let metadata_matches_cli = meta.workspace_root == workspace_root
-            && meta.executor.provider == ctx.args.executor_provider
-            && meta.reviewer.provider == ctx.args.reviewer_provider
-            && meta.executor.session_title == executor_thread_name
-            && meta.reviewer.session_title == reviewer_thread_name;
-
-        if metadata_matches_cli {
-            validate_session_metadata(
-                &meta,
-                &executor_thread_name,
-                &reviewer_thread_name,
-                &workspace_root,
-                ctx.args.executor_provider,
-                ctx.args.reviewer_provider,
-            )?;
-            ctx.executor_session_id = Some(meta.executor.session_id.clone());
-            ctx.reviewer_session_id = Some(meta.reviewer.session_id.clone());
-            tracing::info!(
-                "reused session metadata executor_provider={} executor_session={} reviewer_provider={} reviewer_session={}",
-                meta.executor.provider,
-                meta.executor.session_id,
-                meta.reviewer.provider,
-                meta.reviewer.session_id
-            );
-            ctx.run_state = RunState::ExecutorDispatch;
-            phase_separator_wait().await;
-            return Ok(());
-        }
-    }
 
     let executor_session_id = discover_session(
         &repo,
@@ -201,61 +220,15 @@ pub(super) async fn do_session_bind(ctx: &mut OrchestratorCtx) -> OrchestratorRe
         });
     }
 
-    let now = Utc::now();
-    let meta = SessionMetadata {
-        workspace_root,
-        executor: RoleSessionRecord {
-            provider: ctx.args.executor_provider,
-            session_id: executor_session_id.clone(),
-            session_title: executor_thread_name.clone(),
-            discovery_source: discovery_source(ctx.args.executor_provider),
-            discovered_at: now,
-        },
-        reviewer: RoleSessionRecord {
-            provider: ctx.args.reviewer_provider,
-            session_id: reviewer_session_id.clone(),
-            session_title: reviewer_thread_name.clone(),
-            discovery_source: discovery_source(ctx.args.reviewer_provider),
-            discovered_at: now,
-        },
-    };
-
-    let commit_hash = write_and_commit_session_metadata(&repo, &meta).await?;
-    ctx.metadata_commit_hash = commit_hash;
     ctx.executor_session_id = Some(executor_session_id.clone());
     ctx.reviewer_session_id = Some(reviewer_session_id.clone());
-    if ctx.metadata_commit_hash.is_some() {
-        tracing::info!(
-            "session metadata refreshed metadata_commit={} executor_provider={} executor_session={} reviewer_provider={} reviewer_session={}",
-            ctx.metadata_commit_hash.as_deref().unwrap_or("<none>"),
-            ctx.args.executor_provider,
-            executor_session_id,
-            ctx.args.reviewer_provider,
-            reviewer_session_id
-        );
-    } else {
-        tracing::info!(
-            "session metadata already current executor_provider={} executor_session={} reviewer_provider={} reviewer_session={}",
-            ctx.args.executor_provider,
-            ctx.executor_session_id.as_deref().unwrap_or("<none>"),
-            ctx.args.reviewer_provider,
-            ctx.reviewer_session_id.as_deref().unwrap_or("<none>")
-        );
-    }
-
-    // Re-capture HEAD after metadata write/commit so executor commit ranges
-    // (initial_git_head..HEAD) do not include the orchestrator's own commit.
-    ctx.initial_git_head = current_head_optional(ctx.repo()).await?;
-
-    // A pre-commit hook could modify files and exit 0 without staging them,
-    // leaving a dirty worktree. Verify cleanliness before handing off to executor.
-    let post_commit_status =
-        run_git(ctx.repo(), &["status", "--short", "--untracked-files=all"]).await?;
-    if !post_commit_status.trim().is_empty() {
-        return Err(OrchestratorError::DirtyWorktree {
-            status: post_commit_status,
-        });
-    }
+    tracing::info!(
+        "sessions discovered executor_provider={} executor_session={} reviewer_provider={} reviewer_session={}",
+        ctx.args.executor_provider,
+        executor_session_id,
+        ctx.args.reviewer_provider,
+        reviewer_session_id
+    );
 
     ctx.run_state = RunState::ExecutorDispatch;
     phase_separator_wait().await;
@@ -346,14 +319,6 @@ async fn discover_session(
     }
 }
 
-fn discovery_source(provider: ProviderKind) -> String {
-    match provider {
-        ProviderKind::Claude => "~/.claude/projects/<key>/*.jsonl".to_owned(),
-        ProviderKind::Opencode => "opencode session list --format json".to_owned(),
-        ProviderKind::Codex => "~/.codex/session_index.jsonl".to_owned(),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Phase: EXECUTOR_DISPATCH / REVIEWER_DISPATCH
 // ---------------------------------------------------------------------------
@@ -376,6 +341,10 @@ async fn dispatch_role(ctx: &mut OrchestratorCtx, role: AgentRole) -> Orchestrat
     let provider = match role {
         AgentRole::Executor => ctx.args.executor_provider,
         AgentRole::Reviewer => ctx.args.reviewer_provider,
+    };
+    let model = match role {
+        AgentRole::Executor => ctx.args.executor_model.as_deref(),
+        AgentRole::Reviewer => ctx.args.reviewer_model.as_deref(),
     };
     let session_id = ctx
         .session_id(role)
@@ -442,7 +411,7 @@ async fn dispatch_role(ctx: &mut OrchestratorCtx, role: AgentRole) -> Orchestrat
         TemplateId::ReviewerReview
     };
 
-    let values = build_template_values(ctx, role).await?;
+    let values = build_template_values(ctx, role, template_id).await?;
     let prompt_text = render_template(template_id, &values);
     let fingerprint = write_request(ctx.repo(), &prompt_text).await?;
     let inbox_path = ctx
@@ -455,7 +424,12 @@ async fn dispatch_role(ctx: &mut OrchestratorCtx, role: AgentRole) -> Orchestrat
         log_transport_snapshot("inbox", snapshot);
     }
 
-    let process = dispatch(provider, &session_id, ctx.repo()).await?;
+    let outbox_path = ctx
+        .repo()
+        .join(crate::constants::TRANSPORT_DIR)
+        .join(crate::constants::OUTBOX_FILE);
+    let trigger_prompt = crate::constants::trigger_prompt(&inbox_path, &outbox_path);
+    let process = dispatch(provider, &session_id, ctx.repo(), &trigger_prompt, model).await?;
     let pid = process.child.id();
 
     let now = Utc::now();
@@ -495,9 +469,16 @@ async fn dispatch_role(ctx: &mut OrchestratorCtx, role: AgentRole) -> Orchestrat
 async fn build_template_values(
     ctx: &OrchestratorCtx,
     role: AgentRole,
+    template_id: TemplateId,
 ) -> OrchestratorResult<TemplateValues> {
     let workflow_type = ctx.args.workflow_type;
     let git_facts = format_git_facts(ctx.repo(), ctx.initial_git_head.as_deref()).await?;
+    let transport_dir = ctx.repo().join(crate::constants::TRANSPORT_DIR);
+    let inbox_path = transport_dir.join(crate::constants::INBOX_FILE);
+    let outbox_path = transport_dir.join(crate::constants::OUTBOX_FILE);
+    let orchestrator_docs_dir = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("docs");
 
     let review_result_yaml = ctx.review_result_yaml_raw.clone();
     let feedback_for_executor = ctx.review_result.as_ref().map(|r| {
@@ -508,10 +489,19 @@ async fn build_template_values(
             .collect::<Vec<_>>()
             .join("\n")
     });
+    let runlim_rule = if template_id != TemplateId::ReviewerRepairYaml {
+        runlim_rule(ctx.repo()).await
+    } else {
+        None
+    };
 
     Ok(TemplateValues {
         workflow_type,
         workspace_root: ctx.repo().to_string_lossy().into_owned(),
+        transport_dir: transport_dir.to_string_lossy().into_owned(),
+        inbox_path: inbox_path.to_string_lossy().into_owned(),
+        outbox_path: outbox_path.to_string_lossy().into_owned(),
+        orchestrator_docs_dir: orchestrator_docs_dir.to_string_lossy().into_owned(),
         branch: ctx.branch.clone(),
         user_prompt: ctx.args.prompt.clone(),
         notion_policy: ctx.args.notion_policy,
@@ -531,7 +521,101 @@ async fn build_template_values(
         },
         review_result_yaml,
         feedback_for_executor,
+        runlim_rule,
     })
+}
+
+async fn runlim_rule(repo: &std::path::Path) -> Option<String> {
+    match resolve_runlim_binary(repo).await {
+        Some(path) => {
+            tracing::info!(
+                "runlim preflight: resolved executable at {}",
+                path.display()
+            );
+            let path = path.display().to_string();
+            Some(format!(
+                "- To run `cargo run` (running the built project / binary) and `cargo test`, use the absolute path to runlim: `{path}`. Examples: `{path} cargo run ...` and `{path} cargo test ...`.\n"
+            ))
+        }
+        None => {
+            tracing::warn!(
+                "runlim preflight: executable binary not found (PATH + bashrc probe); prompts will fall back to normal run instructions"
+            );
+            None
+        }
+    }
+}
+
+async fn resolve_runlim_binary(repo: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Some(path) = resolve_runlim_from_path(repo).await {
+        return Some(path);
+    }
+    resolve_runlim_from_bashrc(repo).await
+}
+
+async fn resolve_runlim_from_path(repo: &std::path::Path) -> Option<std::path::PathBuf> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::process::Command::new("sh")
+            .args(["-lc", "command -v runlim"])
+            .current_dir(repo)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_runlim_path(&output.stdout)
+}
+
+async fn resolve_runlim_from_bashrc(repo: &std::path::Path) -> Option<std::path::PathBuf> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::process::Command::new("bash")
+            .args(["-ic", "command -v runlim"])
+            .current_dir(repo)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_runlim_path(&output.stdout)
+}
+
+fn parse_runlim_path(stdout: &[u8]) -> Option<std::path::PathBuf> {
+    let text = String::from_utf8_lossy(stdout);
+    let candidate = text.lines().next()?.trim();
+    if !candidate.starts_with('/') {
+        return None;
+    }
+    let path = std::path::PathBuf::from(candidate);
+    if !is_executable_file(&path) {
+        return None;
+    }
+    Some(path)
+}
+
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,6 +1265,8 @@ mod tests {
             prompt: "do work".to_owned(),
             executor_provider: ProviderKind::Claude,
             reviewer_provider: ProviderKind::Opencode,
+            executor_model: None,
+            reviewer_model: None,
         })
     }
 
@@ -1233,10 +1319,56 @@ mod tests {
             prompt: "   ".to_owned(),
             executor_provider: ProviderKind::Claude,
             reviewer_provider: ProviderKind::Opencode,
+            executor_model: None,
+            reviewer_model: None,
         });
         let err = validate_inputs(&mut ctx).unwrap_err();
         assert!(
             matches!(err, OrchestratorError::InvalidInput { ref field, .. } if field == "--prompt")
+        );
+    }
+
+    #[test]
+    fn validate_inputs_rejects_model_for_non_opencode_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = OrchestratorCtx::new(crate::orchestrator::CliArgs {
+            workflow_type: WorkflowType::Implement,
+            notion_policy: crate::state::NotionPolicy::Optional,
+            remote_network_policy: crate::state::RemoteNetworkPolicy::Forbidden,
+            workspace_root: dir.path().to_path_buf(),
+            executor_thread_name: "exec".to_owned(),
+            reviewer_thread_name: "review".to_owned(),
+            prompt: "do work".to_owned(),
+            executor_provider: ProviderKind::Claude,
+            reviewer_provider: ProviderKind::Opencode,
+            executor_model: Some("deepseek/deepseek-v4-flash".to_owned()),
+            reviewer_model: None,
+        });
+        let err = validate_inputs(&mut ctx).unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::InvalidInput { ref field, .. } if field == "--executor-model")
+        );
+    }
+
+    #[test]
+    fn validate_inputs_rejects_invalid_model_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = OrchestratorCtx::new(crate::orchestrator::CliArgs {
+            workflow_type: WorkflowType::Implement,
+            notion_policy: crate::state::NotionPolicy::Optional,
+            remote_network_policy: crate::state::RemoteNetworkPolicy::Forbidden,
+            workspace_root: dir.path().to_path_buf(),
+            executor_thread_name: "exec".to_owned(),
+            reviewer_thread_name: "review".to_owned(),
+            prompt: "do work".to_owned(),
+            executor_provider: ProviderKind::Opencode,
+            reviewer_provider: ProviderKind::Claude,
+            executor_model: Some("deepseek".to_owned()),
+            reviewer_model: None,
+        });
+        let err = validate_inputs(&mut ctx).unwrap_err();
+        assert!(
+            matches!(err, OrchestratorError::InvalidInput { ref field, .. } if field == "--executor-model")
         );
     }
 
@@ -1251,6 +1383,8 @@ mod tests {
             prompt: "do work".to_owned(),
             executor_provider: ProviderKind::Claude,
             reviewer_provider: ProviderKind::Opencode,
+            executor_model: None,
+            reviewer_model: None,
         });
         ctx.branch = "main".to_owned();
         ctx.current_role = Some(AgentRole::Reviewer);

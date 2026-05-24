@@ -47,7 +47,7 @@ struct Cli {
     #[arg(long, default_value = "optional")]
     notion_policy: NotionPolicy,
 
-    /// Remote network policy for external production systems: forbidden | allowed
+    /// Remote network policy for remote target systems: forbidden | read_only | operational
     #[arg(long, default_value = "forbidden")]
     remote_network_policy: RemoteNetworkPolicy,
 
@@ -58,6 +58,14 @@ struct Cli {
     /// Reviewer provider: claude | opencode | codex
     #[arg(long)]
     reviewer_provider: ProviderKind,
+
+    /// Optional executor model override. Currently supported only for OpenCode, in provider/model format.
+    #[arg(long)]
+    executor_model: Option<String>,
+
+    /// Optional reviewer model override. Currently supported only for OpenCode, in provider/model format.
+    #[arg(long)]
+    reviewer_model: Option<String>,
 }
 
 #[tokio::main]
@@ -82,6 +90,8 @@ async fn main() {
         remote_network_policy: cli.remote_network_policy,
         executor_provider: cli.executor_provider,
         reviewer_provider: cli.reviewer_provider,
+        executor_model: cli.executor_model,
+        reviewer_model: cli.reviewer_model,
     };
 
     let report = orchestrator::run(args).await;

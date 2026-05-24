@@ -56,6 +56,8 @@ pub struct CliArgs {
     pub prompt: String,
     pub executor_provider: ProviderKind,
     pub reviewer_provider: ProviderKind,
+    pub executor_model: Option<String>,
+    pub reviewer_model: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +96,6 @@ pub struct OrchestratorCtx {
     // --- Session bindings (set during SESSION_BIND) ---
     pub executor_session_id: Option<String>,
     pub reviewer_session_id: Option<String>,
-    pub metadata_commit_hash: Option<String>,
 
     /// Lock files held open for the duration of the run (drop to release).
     pub(super) executor_lock: Option<std::fs::File>,
@@ -152,7 +153,6 @@ impl OrchestratorCtx {
             claude_project_key: None,
             executor_session_id: None,
             reviewer_session_id: None,
-            metadata_commit_hash: None,
             executor_lock: None,
             reviewer_lock: None,
             attempt: None,
@@ -207,10 +207,11 @@ impl OrchestratorCtx {
             executor_provider: Some(self.args.executor_provider),
             executor_session_id: self.executor_session_id.clone(),
             executor_thread_name: self.args.executor_thread_name.clone(),
+            executor_model: self.args.executor_model.clone(),
             reviewer_provider: Some(self.args.reviewer_provider),
             reviewer_session_id: self.reviewer_session_id.clone(),
             reviewer_thread_name: self.args.reviewer_thread_name.clone(),
-            metadata_commit_hash: self.metadata_commit_hash.clone(),
+            reviewer_model: self.args.reviewer_model.clone(),
             consecutive_failure_count: self.consecutive_failure_count,
             quality_score: review.map(|r| r.quality_score),
             reviewer_decision: review.map(|r| r.decision.as_str().to_owned()),
@@ -254,6 +255,12 @@ pub async fn run(args: CliArgs) -> FinalReport {
 
     // RUN_INIT → validate and enter CONTEXT_PREP
     if let Err(e) = phases::validate_inputs(&mut ctx) {
+        ctx.run_state = RunState::RunFailedInvalidInput;
+        ctx.failures.push(e.to_string());
+        return ctx.build_report();
+    }
+
+    if let Err(e) = phases::validate_provider_models(&ctx).await {
         ctx.run_state = RunState::RunFailedInvalidInput;
         ctx.failures.push(e.to_string());
         return ctx.build_report();

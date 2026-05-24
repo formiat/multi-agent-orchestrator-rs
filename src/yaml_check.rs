@@ -238,7 +238,7 @@ mod tests {
     const MINIMAL_ACCEPT: &str = r#"
 quality_score: 9.0
 decision: accept
-rationale: Everything is good
+rationale: Looks good
 contract_satisfied: true
 hard_blockers_present: false
 notion_requirements_satisfied: true
@@ -352,7 +352,7 @@ poisoned_session_reason: null
 
     #[test]
     fn reject_empty_rationale() {
-        let raw = MINIMAL_ACCEPT.replace("rationale: Everything is good", "rationale: \"   \"");
+        let raw = MINIMAL_ACCEPT.replace("rationale: Looks good", "rationale: \"   \"");
         let result = parse_reviewer_yaml(&raw);
         assert!(result.is_err());
     }

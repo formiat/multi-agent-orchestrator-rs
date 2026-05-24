@@ -25,10 +25,22 @@ fn is_cancelled() -> bool {
 }
 
 fn parse_git_status_path(line: &str) -> Option<String> {
-    if line.len() < 3 {
+    let line = line.trim_end();
+    if line.trim().is_empty() {
         return None;
     }
-    let rest = line[3..].trim();
+    let rest = if line.as_bytes().get(2) == Some(&b' ') {
+        &line[3..]
+    } else if let Some((status, path)) = line.split_once(' ') {
+        if status.len() <= 2 && status.bytes().all(|b| b.is_ascii_graphic()) {
+            path
+        } else {
+            line
+        }
+    } else {
+        line
+    };
+    let rest = rest.trim();
     if rest.is_empty() {
         return None;
     }
@@ -36,6 +48,14 @@ fn parse_git_status_path(line: &str) -> Option<String> {
         return Some(rhs.trim().to_owned());
     }
     Some(rest.to_owned())
+}
+
+fn git_status_lines(raw: &str) -> BTreeSet<String> {
+    raw.lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn top_hot_files(
@@ -209,13 +229,7 @@ pub(super) async fn do_monitor(
             collect_probe_signals(ctx.repo(), pid, &artifact_names, provider, session_id).await?;
 
         ctx.artifact_map = signals.artifact_map.clone();
-        let git_lines: BTreeSet<String> = signals
-            .git_status_short
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_owned)
-            .collect();
+        let git_lines = git_status_lines(&signals.git_status_short);
 
         // Determine if any work signal changed since the previous probe cycle.
         // `process_alive` is deliberately excluded: it is a liveness signal, not an activity
@@ -423,20 +437,6 @@ pub(super) async fn do_monitor(
 
         if prev_state != Some(attempt_state) {
             tracing::info!("state change: role={role:?} {prev_state:?} → {attempt_state:?}");
-        }
-
-        // Log the first cycle that enters HangSuspected so operators can observe detection.
-        if attempt_state == AttemptState::HangSuspected
-            && prev_state != Some(AttemptState::HangSuspected)
-        {
-            let stale_secs = snapshot
-                .last_work_signal_ts
-                .map(|t| (now - t).num_seconds().max(0))
-                .unwrap_or(0);
-            tracing::warn!(
-                "hang suspected: role={role:?} no activity for {stale_secs}s; \
-                 waiting for provider-log confirmation"
-            );
         }
 
         if let Some(attempt) = ctx.attempt.as_mut() {
@@ -659,19 +659,9 @@ async fn detect_provider_error(
         return Ok(Some(matched));
     }
 
-    // Claude JSONL is written by the process while it runs — only check after exit to avoid
-    // reading a partially-written record.
-    let process_alive = ctx
-        .attempt
-        .as_ref()
-        .map(|a| a.pid.is_some())
-        .unwrap_or(true);
-    if process_alive {
-        return Ok(None);
-    }
-
     // Fallback: check Claude JSONL for service-cap signals that may not be present
     // in stdout/stderr (max_tokens overflow, rate_limit synthetic API errors).
+    // This runs while the process is alive; the parser ignores incomplete JSONL records.
     let Some(role) = ctx.attempt.as_ref().map(|a| a.role) else {
         return Ok(None);
     };
@@ -681,36 +671,25 @@ async fn detect_provider_error(
     };
     if provider == ProviderKind::Claude {
         if let Some(session_id) = ctx.session_id(role) {
-            let has_fresh_jsonl_signal =
-                crate::providers::claude::session_jsonl_mtime(ctx.repo(), session_id)?
-                    .map(|mtime| {
-                        let mtime = chrono::DateTime::<chrono::Utc>::from(mtime);
-                        let dispatch_ts =
-                            ctx.attempt.as_ref().map(|a| a.dispatch_ts).unwrap_or(mtime);
-                        mtime >= dispatch_ts
-                    })
-                    .unwrap_or(false);
-            if !has_fresh_jsonl_signal {
+            let Some(dispatch_ts) = ctx.attempt.as_ref().map(|a| a.dispatch_ts) else {
                 return Ok(None);
-            }
-            if crate::providers::claude::session_jsonl_has_max_tokens(ctx.repo(), session_id)
-                .await?
+            };
+            if let Some(signal) = crate::providers::claude::session_jsonl_service_cap_since(
+                ctx.repo(),
+                session_id,
+                dispatch_ts,
+            )
+            .await?
             {
-                tracing::warn!("provider error: claude max_tokens — context overflow, classifying as service cap");
+                tracing::warn!(
+                    "provider error: claude JSONL service cap — pattern={} fragment={}",
+                    signal.pattern,
+                    signal.fragment
+                );
                 return Ok(Some(ProviderErrorMatch {
                     class: ProviderErrorClass::ServiceCap,
-                    pattern: "claude_jsonl_max_tokens",
-                    fragment: "max_tokens".to_owned(),
-                }));
-            }
-            if crate::providers::claude::session_jsonl_has_rate_limit(ctx.repo(), session_id)
-                .await?
-            {
-                tracing::warn!("provider error: claude rate_limit — classifying as service cap");
-                return Ok(Some(ProviderErrorMatch {
-                    class: ProviderErrorClass::ServiceCap,
-                    pattern: "claude_jsonl_rate_limit",
-                    fragment: "rate_limit".to_owned(),
+                    pattern: signal.pattern,
+                    fragment: signal.fragment,
                 }));
             }
         }
@@ -955,6 +934,43 @@ mod tests {
     }
 
     const NOW: fn() -> DateTime<Utc> = || t(0);
+
+    #[test]
+    fn parse_git_status_path_handles_standard_short_status() {
+        assert_eq!(
+            parse_git_status_path(" M PLAN.md").as_deref(),
+            Some("PLAN.md")
+        );
+        assert_eq!(
+            parse_git_status_path("?? PLAN.md").as_deref(),
+            Some("PLAN.md")
+        );
+        assert_eq!(
+            parse_git_status_path(" R old.md -> new.md").as_deref(),
+            Some("new.md")
+        );
+    }
+
+    #[test]
+    fn parse_git_status_path_handles_trimmed_short_status() {
+        assert_eq!(
+            parse_git_status_path("M PLAN.md").as_deref(),
+            Some("PLAN.md")
+        );
+        assert_eq!(
+            parse_git_status_path("R old.md -> new.md").as_deref(),
+            Some("new.md")
+        );
+    }
+
+    #[test]
+    fn git_status_lines_preserve_index_worktree_columns() {
+        let lines = git_status_lines(" M PLAN.md\n?? NEW.md\n\n");
+
+        assert!(lines.contains(" M PLAN.md"));
+        assert!(lines.contains("?? NEW.md"));
+        assert!(!lines.contains("M PLAN.md"));
+    }
 
     #[test]
     fn grace_opens_on_dirty_worktree() {

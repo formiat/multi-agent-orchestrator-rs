@@ -311,6 +311,14 @@ mod tests {
                 .map(|m| m.class),
             Some(ProviderErrorClass::ServiceCap)
         );
+        // Kimi/OpenCode: "You've reached your usage limit"
+        assert_eq!(
+            classify_provider_error_with_match(
+                "You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle."
+            )
+            .map(|m| m.class),
+            Some(ProviderErrorClass::ServiceCap)
+        );
         // Claude synthetic API error: "You've hit your limit" (without "usage")
         assert_eq!(
             classify_provider_error_with_match("You've hit your limit · resets 2:10pm")

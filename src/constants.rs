@@ -4,8 +4,6 @@ pub const TRANSPORT_DIR: &str = ".agent-io";
 pub const INBOX_FILE: &str = "inbox.txt";
 /// Outbox file within the transport directory.
 pub const OUTBOX_FILE: &str = "outbox.txt";
-/// Session metadata file at workspace root.
-pub const SESSION_METADATA_FILE: &str = "ORCHESTRATOR_SESSIONS.json";
 
 // ---------------------------------------------------------------------------
 // Runtime constants — all hardcoded, no runtime config file.
@@ -33,20 +31,11 @@ pub const PROBE_INTERVAL_SEC: u64 = 1;
 /// stretches without being log-noisy on every 10-second cycle.
 pub const HEARTBEAT_INTERVAL_SEC: u64 = 300;
 
-/// Work signals absent for this many seconds → HANG_SUSPECTED (condition A).
+/// Work signals stale AND provider log stale for this many seconds → HANG_CONFIRMED.
 ///
 /// "Work signals" are: live process, changing outbox size/mtime, changing git
-/// status, live child processes (cargo, rustc, pytest, …).  Condition A alone
-/// does not trigger a kill — it is a precondition for hang confirmation.
-pub const HANG_SUSPECT_SEC: u64 = 300;
-
-/// Work signals stale (A) AND provider log stale (B) → HANG_CONFIRMED.
-///
-/// Dual-condition requirement prevents false positives: a provider can be
-/// legitimately silent locally (no file writes) while actively computing
-/// server-side.  Only when the provider-log mtime is also stale for this
-/// duration do we conclude the session is genuinely hung.
-pub const HANG_CONFIRM_SEC: u64 = 300;
+/// status, live child processes (cargo, rustc, pytest, …).
+pub const HANG_CONFIRM_SEC: u64 = 420;
 
 /// Hard ceiling from dispatch: work signals may change but no result appears.
 ///
@@ -97,9 +86,18 @@ pub const PHASE_SEPARATOR_WAIT_SEC: u64 = 5;
 /// Seconds to wait for a child to exit after SIGTERM before escalating to SIGKILL.
 pub const CANCEL_CHILD_WAIT_SEC: u64 = 5;
 
-/// Fixed trigger prompt sent to provider CLI (full task is in inbox.txt).
-pub const TRIGGER_PROMPT: &str = "Read ./.agent-io/inbox.txt and follow it exactly. \
-     Write the required result to ./.agent-io/outbox.txt.";
+/// Build the minimal trigger prompt sent to provider CLI.
+///
+/// The full task is in `inbox_path`; keep these paths absolute to prevent agents
+/// from resolving `.agent-io` relative to the orchestrator repository.
+pub fn trigger_prompt(inbox_path: &std::path::Path, outbox_path: &std::path::Path) -> String {
+    format!(
+        "Read the inbox at absolute path `{}` and follow it exactly. \
+         Write the required result to the outbox at absolute path `{}`.",
+        inbox_path.display(),
+        outbox_path.display()
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Provider error signature catalog
@@ -108,6 +106,7 @@ pub const TRIGGER_PROMPT: &str = "Read ./.agent-io/inbox.txt and follow it exact
 /// Service cap / quota patterns applied to provider stdout/stderr.
 pub const SERVICE_CAP_PATTERNS: &[&str] = &[
     r"(?i)usage limit (reached|exceeded|hit)",
+    r"(?i)reached your usage limit",
     r"(?i)hit your usage limit",
     r"(?i)you'?ve hit your limit",
     r"(?i)rate limit exceeded",
@@ -174,4 +173,21 @@ pub fn regex_catalog() -> &'static RegexCatalog {
         transport: RegexSet::new(TRANSPORT_PATTERNS).expect("transport regex"),
         auth: RegexSet::new(AUTH_PATTERNS).expect("auth regex"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    #[test]
+    fn trigger_prompt_uses_absolute_transport_paths() {
+        let prompt = super::trigger_prompt(
+            Path::new("/repo/.agent-io/inbox.txt"),
+            Path::new("/repo/.agent-io/outbox.txt"),
+        );
+
+        assert!(prompt.contains("/repo/.agent-io/inbox.txt"));
+        assert!(prompt.contains("/repo/.agent-io/outbox.txt"));
+        assert!(!prompt.contains("./.agent-io"));
+    }
 }
