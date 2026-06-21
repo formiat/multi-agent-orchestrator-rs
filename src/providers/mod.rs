@@ -26,16 +26,7 @@ use tokio::process::Child;
 use crate::errors::OrchestratorResult;
 use crate::state::ProviderKind;
 
-/// Disable proptest regression-file persistence for all agent-spawned commands.
-///
-/// Agents inherit this env var, so their `cargo test` invocations do not create
-/// `*.proptest-regressions` files in the target workspace as an orchestration side effect.
-pub const PROPTEST_DISABLE_FAILURE_PERSISTENCE_ENV: (&str, &str) =
-    ("PROPTEST_DISABLE_FAILURE_PERSISTENCE", "1");
-
 pub fn apply_agent_env(cmd: &mut tokio::process::Command) {
-    let (key, value) = PROPTEST_DISABLE_FAILURE_PERSISTENCE_ENV;
-    cmd.env(key, value);
     if let Some(path) = enriched_path_for_agents() {
         cmd.env("PATH", path);
     }

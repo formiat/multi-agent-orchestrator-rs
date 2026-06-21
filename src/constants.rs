@@ -92,7 +92,7 @@ pub const CANCEL_CHILD_WAIT_SEC: u64 = 5;
 /// from resolving `.agent-io` relative to the orchestrator repository.
 pub fn trigger_prompt(inbox_path: &std::path::Path, outbox_path: &std::path::Path) -> String {
     format!(
-        "Read the inbox at absolute path `{}` and follow it exactly. \
+        "Read the inbox at absolute path `{}` right now, even if you think you already know its contents, and follow it exactly. \
          Write the required result to the outbox at absolute path `{}`.",
         inbox_path.display(),
         outbox_path.display()
@@ -188,6 +188,8 @@ mod tests {
 
         assert!(prompt.contains("/repo/.agent-io/inbox.txt"));
         assert!(prompt.contains("/repo/.agent-io/outbox.txt"));
+        assert!(prompt.contains("right now"));
+        assert!(prompt.contains("even if you think you already know its contents"));
         assert!(!prompt.contains("./.agent-io"));
     }
 }

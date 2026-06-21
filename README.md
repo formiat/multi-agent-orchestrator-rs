@@ -8,9 +8,9 @@ Runs a structured workflow where an executor agent (Claude, OpenCode, or Codex) 
 
 Three workflow types:
 
-- **investigate** — input: user prompt; output: `INVESTIGATION.md` with evidence-backed research findings and conclusions
+- **investigate** (`inv`) — input: user prompt; output: `INVESTIGATION.md` with evidence-backed research findings and conclusions
 - **plan** — input: user prompt plus optional `INVESTIGATION.md`; output: `PLAN.md` with implementation plan and automated test strategy
-- **implement** — input: user prompt plus optional `PLAN.md`; output: local commit(s) with implementation and test changes
+- **implement** (`impl`) — input: user prompt plus optional `PLAN.md`; output: local commit(s) with implementation and test changes
 
 The loop runs until the reviewer returns `decision: accept` with `quality_score >= 8`, a hard stop condition is reached, or the operator cancels.
 
@@ -35,7 +35,7 @@ make build
 
 ```bash
 orchestrate \
-  --workflow <plan|investigate|implement> \
+  --workflow <plan|investigate|inv|implement|impl> \
   --workspace-root <path> \
   --executor-thread-name <session-title> \
   --reviewer-thread-name <session-title> \
@@ -237,11 +237,11 @@ CONTEXT_PREP → SESSION_BIND → EXECUTOR_DISPATCH ←────────�
 
 Reviewer retries are intentionally allowed even when the reviewer already modified `.agent-io/outbox.txt`. This relies on persistent provider sessions: if the reviewer cleared or overwrote outbox, it is assumed to have already read the executor result and to retain that context in its session. A retried reviewer batch request is therefore expected to continue in the same reviewer session, not replay from a stateless process snapshot. If the provider loses that context, retries may fail again and eventually stop at the consecutive failure limit.
 
+Reviewer dirty-worktree cleanup uses the same retry mechanism. Reviewer output collection first parses and stores the reviewer YAML verdict, then checks for new `git status --short --untracked-files=all` entries beyond the pre-reviewer baseline (excluding `.agent-io/outbox.txt`). If cleanup is needed, the orchestrator sends a dedicated prompt asking the reviewer only to clean the workspace, not to rewrite the saved verdict. The reviewer may either revert/delete the leftover files or create a local commit; commits are not treated as failures as long as the working tree has no new dirty entries afterward. After cleanup, the stored YAML verdict proceeds to the quality gate.
+
 **Session locking:** a file lock keyed by `(provider, session_id)` prevents two orchestrator processes from dispatching to the same session simultaneously.
 
-**Agent run limits:** the orchestrator performs a `runlim` preflight (`command -v runlim` via shell `PATH`, plus an interactive-bash probe for `~/.bashrc`-provided commands), accepts only an absolute executable file path, logs the resolved source path, and injects that absolute path into normal executor/reviewer prompts for `cargo run`/`cargo test` examples. Reviewer YAML-repair prompts do not include this hint. Provider dispatch env also enriches `PATH` with `~/.local/bin` and `/usr/local/bin` so non-interactive agent subprocesses can resolve `runlim` more reliably.
-
-**Agent test hygiene:** provider processes are dispatched with `PROPTEST_DISABLE_FAILURE_PERSISTENCE=1` so agent-run `cargo test` commands do not create `*.proptest-regressions` files in the target workspace. Normal executor/reviewer prompts also explicitly tell agents to use `PROPTEST_DISABLE_FAILURE_PERSISTENCE=1 cargo test ...` and not to leave or commit proptest regression files.
+**Target project profiles:** normal executor/reviewer prompts require agents to read [`docs/project_profiles/generic.md`](docs/project_profiles/generic.md), detect the target workspace stack, and then apply relevant language-specific profiles such as [`docs/project_profiles/rust.md`](docs/project_profiles/rust.md) or [`docs/project_profiles/cpp.md`](docs/project_profiles/cpp.md). The generic profile requires repo-approved commands first, scoped checks before broad checks, and explicit skipped-check reporting. Role-specific prompt rules tell executors how to report applied profiles in outbox and reviewers how to verify profile usage in `checks_performed`. Add new stack profiles under `docs/project_profiles/` and reference them from the prompt profile-selection block in `src/workflow.rs`.
 
 ## Logging
 

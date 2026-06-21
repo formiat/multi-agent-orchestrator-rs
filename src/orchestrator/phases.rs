@@ -1,5 +1,7 @@
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
 use chrono::{DateTime, Utc};
-use std::time::Duration;
 
 use crate::constants::{CONSECUTIVE_FAILURE_LIMIT, PHASE_SEPARATOR_WAIT_SEC};
 use crate::errors::{OrchestratorError, OrchestratorResult};
@@ -147,6 +149,10 @@ pub(super) async fn do_context_prep(ctx: &mut OrchestratorCtx) -> OrchestratorRe
     let repo = ctx.repo();
 
     validate_git_worktree(repo).await?;
+    validate_git_top_level(repo).await?;
+    validate_no_git_locks(repo).await?;
+    validate_no_unmerged_index(repo).await?;
+    validate_no_git_operation_in_progress(repo).await?;
 
     // .agent-io/ must be in .git/info/exclude before the dirty-worktree check so that
     // transport files are never reported as untracked, even if the directory already
@@ -160,7 +166,8 @@ pub(super) async fn do_context_prep(ctx: &mut OrchestratorCtx) -> OrchestratorRe
 
     let branch = current_branch_name(repo).await?;
 
-    let initial_git_head = current_head_optional(repo).await?;
+    let initial_git_head = current_head_required(repo).await?;
+    log_git_start_warnings(repo).await;
 
     let project_key = if ctx.args.executor_provider == ProviderKind::Claude
         || ctx.args.reviewer_provider == ProviderKind::Claude
@@ -171,7 +178,7 @@ pub(super) async fn do_context_prep(ctx: &mut OrchestratorCtx) -> OrchestratorRe
     };
 
     ctx.branch = branch;
-    ctx.initial_git_head = initial_git_head;
+    ctx.initial_git_head = Some(initial_git_head);
     ctx.claude_project_key = project_key;
     ctx.run_state = RunState::SessionBind;
 
@@ -235,7 +242,7 @@ pub(super) async fn do_session_bind(ctx: &mut OrchestratorCtx) -> OrchestratorRe
     Ok(())
 }
 
-async fn validate_git_worktree(repo: &std::path::Path) -> OrchestratorResult<()> {
+async fn validate_git_worktree(repo: &Path) -> OrchestratorResult<()> {
     let output = tokio::process::Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(repo)
@@ -252,7 +259,131 @@ async fn validate_git_worktree(repo: &std::path::Path) -> OrchestratorResult<()>
     Ok(())
 }
 
-async fn current_branch_name(repo: &std::path::Path) -> OrchestratorResult<String> {
+async fn validate_git_top_level(repo: &Path) -> OrchestratorResult<()> {
+    let top_level = run_git(repo, &["rev-parse", "--show-toplevel"]).await?;
+    let top_level = canonicalize_existing_path("--workspace-root", top_level.trim())?;
+    let repo = canonicalize_existing_path("--workspace-root", repo)?;
+
+    if repo != top_level {
+        return Err(OrchestratorError::InvalidInput {
+            field: "--workspace-root".to_owned(),
+            reason: format!(
+                "must be the git repository top-level; got `{repo}`, top-level is `{top_level}`",
+                repo = repo.display(),
+                top_level = top_level.display()
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn canonicalize_existing_path(field: &str, path: impl AsRef<Path>) -> OrchestratorResult<PathBuf> {
+    path.as_ref()
+        .canonicalize()
+        .map_err(|e| OrchestratorError::InvalidInput {
+            field: field.to_owned(),
+            reason: format!("cannot resolve path `{}`: {e}", path.as_ref().display()),
+        })
+}
+
+async fn validate_no_git_locks(repo: &Path) -> OrchestratorResult<()> {
+    for git_path in ["index.lock", "HEAD.lock", "packed-refs.lock"] {
+        let path = resolve_git_path(repo, git_path).await?;
+        if path.exists() {
+            return Err(git_state_invalid(format!(
+                "git lock file exists: `{}`",
+                path.display()
+            )));
+        }
+    }
+
+    let refs = resolve_git_path(repo, "refs").await?;
+    if let Some(path) = find_lock_file(&refs)? {
+        return Err(git_state_invalid(format!(
+            "git refs lock file exists: `{}`",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+async fn validate_no_git_operation_in_progress(repo: &Path) -> OrchestratorResult<()> {
+    for (state, git_path) in [
+        ("merge", "MERGE_HEAD"),
+        ("rebase", "rebase-merge"),
+        ("rebase", "rebase-apply"),
+        ("cherry-pick", "CHERRY_PICK_HEAD"),
+        ("revert", "REVERT_HEAD"),
+        ("sequencer", "sequencer"),
+        ("bisect", "BISECT_LOG"),
+    ] {
+        let path = resolve_git_path(repo, git_path).await?;
+        if path.exists() {
+            return Err(git_state_invalid(format!(
+                "git operation in progress: {state} marker `{}` exists",
+                path.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+async fn validate_no_unmerged_index(repo: &Path) -> OrchestratorResult<()> {
+    let unmerged = run_git(repo, &["ls-files", "-u"]).await?;
+    if unmerged.trim().is_empty() {
+        return Ok(());
+    }
+
+    let details = unmerged.lines().take(5).collect::<Vec<_>>().join("; ");
+    Err(git_state_invalid(format!(
+        "git index contains unmerged/conflicted entries: {details}"
+    )))
+}
+
+async fn resolve_git_path(repo: &Path, path: &str) -> OrchestratorResult<PathBuf> {
+    let path = run_git(repo, &["rev-parse", "--git-path", path]).await?;
+    let path = PathBuf::from(path.trim());
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(repo.join(path))
+    }
+}
+
+fn find_lock_file(path: &Path) -> OrchestratorResult<Option<PathBuf>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(path) = find_lock_file(&path)? {
+                return Ok(Some(path));
+            }
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "lock")
+        {
+            return Ok(Some(path));
+        }
+    }
+
+    Ok(None)
+}
+
+fn git_state_invalid(reason: String) -> OrchestratorError {
+    OrchestratorError::InvalidInput {
+        field: "--workspace-root".to_owned(),
+        reason,
+    }
+}
+
+async fn current_branch_name(repo: &Path) -> OrchestratorResult<String> {
     let symbolic = tokio::process::Command::new("git")
         .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
         .current_dir(repo)
@@ -266,13 +397,12 @@ async fn current_branch_name(repo: &std::path::Path) -> OrchestratorResult<Strin
         }
     }
 
-    Ok(run_git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .await?
-        .trim()
-        .to_owned())
+    Err(git_state_invalid(
+        "workspace must be on a named branch; detached HEAD is unsupported".to_owned(),
+    ))
 }
 
-async fn current_head_optional(repo: &std::path::Path) -> OrchestratorResult<Option<String>> {
+async fn current_head_required(repo: &Path) -> OrchestratorResult<String> {
     let output = tokio::process::Command::new("git")
         .args(["rev-parse", "--verify", "HEAD"])
         .current_dir(repo)
@@ -287,18 +417,84 @@ async fn current_head_optional(repo: &std::path::Path) -> OrchestratorResult<Opt
                 status: output.status,
             });
         }
-        return Ok(Some(head));
+        return Ok(head);
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     if stderr.contains("Needed a single revision") || stderr.contains("unknown revision") {
-        return Ok(None);
+        return Err(git_state_invalid(
+            "workspace must have a valid HEAD commit; unborn branches are unsupported".to_owned(),
+        ));
     }
 
     Err(OrchestratorError::CommandFailed {
         program: "git rev-parse --verify HEAD".to_owned(),
         status: output.status,
     })
+}
+
+async fn log_git_start_warnings(repo: &Path) {
+    let upstream = try_run_git(
+        repo,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .await
+    .map(|upstream| upstream.trim().to_owned())
+    .filter(|upstream| !upstream.is_empty());
+
+    if let Some(upstream) = upstream {
+        if let Some(counts) = try_run_git(
+            repo,
+            &["rev-list", "--left-right", "--count", "HEAD...@{u}"],
+        )
+        .await
+        {
+            let counts = counts.trim();
+            let mut parts = counts.split_whitespace();
+            let ahead = parts.next().and_then(|value| value.parse::<u32>().ok());
+            let behind = parts.next().and_then(|value| value.parse::<u32>().ok());
+            if let (Some(ahead), Some(behind)) = (ahead, behind) {
+                if ahead > 0 || behind > 0 {
+                    tracing::warn!(
+                        "git startup warning: branch differs from upstream={} ahead={} behind={}",
+                        upstream,
+                        ahead,
+                        behind
+                    );
+                }
+            }
+        }
+    } else {
+        tracing::warn!("git startup warning: branch has no upstream");
+    }
+
+    if try_run_git(repo, &["rev-parse", "--is-shallow-repository"])
+        .await
+        .is_some_and(|value| value.trim() == "true")
+    {
+        tracing::warn!("git startup warning: repository is shallow");
+    }
+
+    if try_run_git(repo, &["config", "--bool", "core.sparseCheckout"])
+        .await
+        .is_some_and(|value| value.trim() == "true")
+    {
+        tracing::warn!("git startup warning: sparse checkout is enabled");
+    }
+}
+
+async fn try_run_git(repo: &Path, args: &[&str]) -> Option<String> {
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .await
+        .ok()?;
+
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Discover a session for the given provider and role.
@@ -345,7 +541,8 @@ async fn dispatch_role(ctx: &mut OrchestratorCtx, role: AgentRole) -> Orchestrat
     let model = match role {
         AgentRole::Executor => ctx.args.executor_model.as_deref(),
         AgentRole::Reviewer => ctx.args.reviewer_model.as_deref(),
-    };
+    }
+    .map(str::to_owned);
     let session_id = ctx
         .session_id(role)
         .ok_or_else(|| OrchestratorError::InvalidInput {
@@ -368,32 +565,29 @@ async fn dispatch_role(ctx: &mut OrchestratorCtx, role: AgentRole) -> Orchestrat
     // Capture baseline git state before dispatch (used by grace-period and work-signal logic).
     let status_out = run_git(ctx.repo(), &["status", "--short"]).await?;
     let dispatch_git_status_hash = crate::transport::sha256_hex(status_out.as_bytes());
+    let dispatch_git_status_lines = git_status_line_set(&status_out);
     let dispatch_git_head_hash = crate::signals::git_head_hash(ctx.repo()).await?;
+    reset_attempt_git_telemetry(ctx, dispatch_git_status_lines.len());
 
     reset_transport(ctx.repo(), role).await?;
 
     // For reviewer: snapshot outbox mtime and git status immediately before dispatch.
     // pre_reviewer_outbox_mtime must be carried into the NEW attempt (not the old executor
     // attempt) because ctx.attempt is replaced below when the reviewer is spawned.
-    // The git status snapshot is the correct baseline for check_reviewer_git_state:
+    // The git status snapshot is the correct baseline for reviewer workspace checks:
     // it reflects the worktree after executor finished, not the clean state from CONTEXT_PREP.
+    // During workspace-cleanup retry, keep the original baseline so reviewer leftovers do not
+    // become the new accepted state.
     let pre_reviewer_outbox_mtime = if role == AgentRole::Reviewer {
         let outbox_path = ctx
             .repo()
             .join(crate::constants::TRANSPORT_DIR)
             .join(crate::constants::OUTBOX_FILE);
         let mtime = optional_file_mtime(&outbox_path).await?;
-        ctx.pre_reviewer_git_status =
-            Some(run_git(ctx.repo(), &["status", "--short", "--untracked-files=all"]).await?);
-        let diff = run_git(ctx.repo(), &["diff", "HEAD"]).await?;
-        ctx.pre_reviewer_git_diff_hash = Some(crate::transport::sha256_hex(diff.as_bytes()));
-        let outbox_rel = format!(
-            "{}/{}",
-            crate::constants::TRANSPORT_DIR,
-            crate::constants::OUTBOX_FILE
-        );
-        ctx.pre_reviewer_untracked_hash =
-            Some(hash_untracked_files(ctx.repo(), &outbox_rel).await?);
+        if ctx.reviewer_workspace_rejection.is_none() {
+            ctx.pre_reviewer_git_status =
+                Some(run_git(ctx.repo(), &["status", "--short", "--untracked-files=all"]).await?);
+        }
         mtime
     } else {
         None
@@ -405,13 +599,15 @@ async fn dispatch_role(ctx: &mut OrchestratorCtx, role: AgentRole) -> Orchestrat
         } else {
             TemplateId::ExecutorInitial
         }
+    } else if ctx.reviewer_workspace_rejection.is_some() {
+        TemplateId::ReviewerRepairWorkspace
     } else if ctx.reviewer_yaml_rejection.is_some() {
         TemplateId::ReviewerRepairYaml
     } else {
         TemplateId::ReviewerReview
     };
 
-    let values = build_template_values(ctx, role, template_id).await?;
+    let values = build_template_values(ctx, role).await?;
     let prompt_text = render_template(template_id, &values);
     let fingerprint = write_request(ctx.repo(), &prompt_text).await?;
     let inbox_path = ctx
@@ -429,7 +625,14 @@ async fn dispatch_role(ctx: &mut OrchestratorCtx, role: AgentRole) -> Orchestrat
         .join(crate::constants::TRANSPORT_DIR)
         .join(crate::constants::OUTBOX_FILE);
     let trigger_prompt = crate::constants::trigger_prompt(&inbox_path, &outbox_path);
-    let process = dispatch(provider, &session_id, ctx.repo(), &trigger_prompt, model).await?;
+    let process = dispatch(
+        provider,
+        &session_id,
+        ctx.repo(),
+        &trigger_prompt,
+        model.as_deref(),
+    )
+    .await?;
     let pid = process.child.id();
 
     let now = Utc::now();
@@ -447,7 +650,7 @@ async fn dispatch_role(ctx: &mut OrchestratorCtx, role: AgentRole) -> Orchestrat
         next_probe_at: now,
         dispatch_git_status_hash: dispatch_git_status_hash.clone(),
         prev_probe_git_status_hash: dispatch_git_status_hash,
-        prev_probe_git_status_lines: std::collections::BTreeSet::new(),
+        prev_probe_git_status_lines: dispatch_git_status_lines,
         dispatch_git_head_hash: dispatch_git_head_hash.clone(),
         prev_probe_git_head_hash: dispatch_git_head_hash,
         prev_probe_outbox_meta: None,
@@ -466,12 +669,29 @@ async fn dispatch_role(ctx: &mut OrchestratorCtx, role: AgentRole) -> Orchestrat
     Ok(())
 }
 
+fn git_status_line_set(raw: &str) -> BTreeSet<String> {
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn reset_attempt_git_telemetry(ctx: &mut OrchestratorCtx, dirty_files_count: usize) {
+    ctx.dirty_file_touch_counts.clear();
+    ctx.committed_file_touch_counts.clear();
+    ctx.last_dirty_files_count = dirty_files_count;
+    ctx.committed_files_seen_count = 0;
+}
+
 async fn build_template_values(
     ctx: &OrchestratorCtx,
     role: AgentRole,
-    template_id: TemplateId,
 ) -> OrchestratorResult<TemplateValues> {
     let workflow_type = ctx.args.workflow_type;
+    let provider = match role {
+        AgentRole::Executor => ctx.args.executor_provider,
+        AgentRole::Reviewer => ctx.args.reviewer_provider,
+    };
     let git_facts = format_git_facts(ctx.repo(), ctx.initial_git_head.as_deref()).await?;
     let transport_dir = ctx.repo().join(crate::constants::TRANSPORT_DIR);
     let inbox_path = transport_dir.join(crate::constants::INBOX_FILE);
@@ -489,13 +709,8 @@ async fn build_template_values(
             .collect::<Vec<_>>()
             .join("\n")
     });
-    let runlim_rule = if template_id != TemplateId::ReviewerRepairYaml {
-        runlim_rule(ctx.repo()).await
-    } else {
-        None
-    };
-
     Ok(TemplateValues {
+        provider,
         workflow_type,
         workspace_root: ctx.repo().to_string_lossy().into_owned(),
         transport_dir: transport_dir.to_string_lossy().into_owned(),
@@ -519,103 +734,14 @@ async fn build_template_values(
         } else {
             None
         },
+        reviewer_workspace_rejection: if role == AgentRole::Reviewer {
+            ctx.reviewer_workspace_rejection.clone()
+        } else {
+            None
+        },
         review_result_yaml,
         feedback_for_executor,
-        runlim_rule,
     })
-}
-
-async fn runlim_rule(repo: &std::path::Path) -> Option<String> {
-    match resolve_runlim_binary(repo).await {
-        Some(path) => {
-            tracing::info!(
-                "runlim preflight: resolved executable at {}",
-                path.display()
-            );
-            let path = path.display().to_string();
-            Some(format!(
-                "- To run `cargo run` (running the built project / binary) and `cargo test`, use the absolute path to runlim: `{path}`. Examples: `{path} cargo run ...` and `{path} cargo test ...`.\n"
-            ))
-        }
-        None => {
-            tracing::warn!(
-                "runlim preflight: executable binary not found (PATH + bashrc probe); prompts will fall back to normal run instructions"
-            );
-            None
-        }
-    }
-}
-
-async fn resolve_runlim_binary(repo: &std::path::Path) -> Option<std::path::PathBuf> {
-    if let Some(path) = resolve_runlim_from_path(repo).await {
-        return Some(path);
-    }
-    resolve_runlim_from_bashrc(repo).await
-}
-
-async fn resolve_runlim_from_path(repo: &std::path::Path) -> Option<std::path::PathBuf> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(3),
-        tokio::process::Command::new("sh")
-            .args(["-lc", "command -v runlim"])
-            .current_dir(repo)
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_runlim_path(&output.stdout)
-}
-
-async fn resolve_runlim_from_bashrc(repo: &std::path::Path) -> Option<std::path::PathBuf> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(3),
-        tokio::process::Command::new("bash")
-            .args(["-ic", "command -v runlim"])
-            .current_dir(repo)
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_runlim_path(&output.stdout)
-}
-
-fn parse_runlim_path(stdout: &[u8]) -> Option<std::path::PathBuf> {
-    let text = String::from_utf8_lossy(stdout);
-    let candidate = text.lines().next()?.trim();
-    if !candidate.starts_with('/') {
-        return None;
-    }
-    let path = std::path::PathBuf::from(candidate);
-    if !is_executable_file(&path) {
-        return None;
-    }
-    Some(path)
-}
-
-fn is_executable_file(path: &std::path::Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -730,6 +856,13 @@ pub(super) async fn do_executor_output_collect(
 /// executor outbox.txt. A raw diagnostic snapshot may be logged and emitted in the final JSON,
 /// but the reviewer remains the only semantic consumer of executor output.
 pub(super) async fn do_orch_verify(ctx: &mut OrchestratorCtx) -> OrchestratorResult<()> {
+    // A new executor round invalidates the previous semantic reviewer verdict.
+    // Keep saved reviewer YAML only across reviewer cleanup retries, not across
+    // executor feedback rounds.
+    ctx.review_result = None;
+    ctx.review_result_yaml_raw = None;
+    ctx.reviewer_yaml_rejection = None;
+    ctx.reviewer_workspace_rejection = None;
     ctx.run_state = RunState::ReviewerDispatch;
     Ok(())
 }
@@ -762,13 +895,15 @@ pub(super) async fn do_reviewer_output_collect(
         return Ok(());
     }
 
-    check_reviewer_git_state(ctx).await?;
-
-    let raw = match tokio::fs::read_to_string(&outbox_path).await {
-        Ok(r) => r,
-        Err(_) => {
-            retry_reviewer_output_failure(ctx, "reviewer outbox not readable");
-            return Ok(());
+    let raw = if ctx.review_result.is_some() {
+        ctx.review_result_yaml_raw.clone().unwrap_or_default()
+    } else {
+        match tokio::fs::read_to_string(&outbox_path).await {
+            Ok(r) => r,
+            Err(_) => {
+                retry_reviewer_output_failure(ctx, "reviewer outbox not readable");
+                return Ok(());
+            }
         }
     };
     let reviewer_session_id = ctx
@@ -787,9 +922,24 @@ pub(super) async fn do_reviewer_output_collect(
         log_transport_snapshot("reviewer_outbox", snapshot);
     }
 
-    match parse_reviewer_yaml(&raw) {
-        Ok(yaml) => {
-            if let Err(e) = enforce_reviewer_notion_policy(ctx.args.notion_policy, &yaml) {
+    if ctx.review_result.is_none() {
+        match parse_reviewer_yaml(&raw) {
+            Ok(yaml) => {
+                if let Err(e) = enforce_reviewer_notion_policy(ctx.args.notion_policy, &yaml) {
+                    let rejection = format!("{e}");
+                    ctx.reviewer_yaml_rejection = Some(rejection.clone());
+                    tracing::warn!("reviewer YAML rejected: {rejection}");
+                    retry_reviewer_output_failure(
+                        ctx,
+                        format!("reviewer YAML parse failed: {rejection}"),
+                    );
+                    return Ok(());
+                }
+                ctx.reviewer_yaml_rejection = None;
+                ctx.review_result_yaml_raw = Some(raw);
+                ctx.review_result = Some(yaml);
+            }
+            Err(e) => {
                 let rejection = format!("{e}");
                 ctx.reviewer_yaml_rejection = Some(rejection.clone());
                 tracing::warn!("reviewer YAML rejected: {rejection}");
@@ -799,19 +949,22 @@ pub(super) async fn do_reviewer_output_collect(
                 );
                 return Ok(());
             }
-            ctx.reviewer_yaml_rejection = None;
-            ctx.review_result_yaml_raw = Some(raw);
-            ctx.review_result = Some(yaml);
-            ctx.run_state = RunState::QualityGate;
-        }
-        Err(e) => {
-            let rejection = format!("{e}");
-            ctx.reviewer_yaml_rejection = Some(rejection.clone());
-            tracing::warn!("reviewer YAML rejected: {rejection}");
-            retry_reviewer_output_failure(ctx, format!("reviewer YAML parse failed: {rejection}"));
-            return Ok(());
         }
     }
+
+    if let Some(reason) = reviewer_workspace_dirty_reason(ctx).await? {
+        ctx.reviewer_workspace_rejection = Some(reason.clone());
+        retry_reviewer_output_failure(
+            ctx,
+            format!("reviewer workspace cleanup required: {reason}"),
+        );
+        return Ok(());
+    }
+    ctx.reviewer_workspace_rejection = None;
+
+    // If cleanup retry succeeded, use the already-saved reviewer YAML from the first
+    // semantic review attempt. Cleanup must not require regenerating the verdict.
+    ctx.run_state = RunState::QualityGate;
 
     phase_separator_wait().await;
     Ok(())
@@ -848,20 +1001,18 @@ fn enforce_reviewer_notion_policy(
     Ok(())
 }
 
-/// Verify that the reviewer did not mutate the repository (other than outbox.txt).
+/// Return a cleanup reason when the reviewer leaves new dirty worktree entries.
 ///
 /// Uses `pre_reviewer_git_status` as the baseline — captured immediately before reviewer
 /// dispatch — not `initial_git_status` from CONTEXT_PREP. The executor may have left
-/// uncommitted artifacts (PLAN.md, INVESTIGATION.md) in the worktree; those must not be
-/// misclassified as reviewer mutations.
+/// uncommitted artifacts (PLAN.md, INVESTIGATION.md) in the worktree; baseline entries are
+/// not treated as reviewer leftovers.
 ///
-/// Three complementary checks:
-/// 1. New `git status --short` lines: catches new or newly-dirty files.
-/// 2. `git diff HEAD` hash: catches content changes to tracked files that were already dirty
-///    before reviewer ran — those have identical status lines before and after.
-/// 3. Untracked-file content hash: catches content changes to untracked files whose
-///    `??` status line is identical before and after, and which `git diff HEAD` does not see.
-async fn check_reviewer_git_state(ctx: &OrchestratorCtx) -> OrchestratorResult<()> {
+/// Reviewer commits are intentionally ignored here. If the reviewer committed its changes and
+/// no new dirty worktree entries remain, the workspace is clean enough to continue.
+async fn reviewer_workspace_dirty_reason(
+    ctx: &OrchestratorCtx,
+) -> OrchestratorResult<Option<String>> {
     let current_status =
         run_git(ctx.repo(), &["status", "--short", "--untracked-files=all"]).await?;
     let initial = ctx.pre_reviewer_git_status.as_deref().unwrap_or("");
@@ -870,61 +1021,45 @@ async fn check_reviewer_git_state(ctx: &OrchestratorCtx) -> OrchestratorResult<(
         crate::constants::TRANSPORT_DIR,
         crate::constants::OUTBOX_FILE
     );
-    check_reviewer_git_state_lines(initial, &current_status, &outbox_rel)?;
-
-    if let Some(pre_hash) = &ctx.pre_reviewer_git_diff_hash {
-        let diff = run_git(ctx.repo(), &["diff", "HEAD"]).await?;
-        let current_hash = crate::transport::sha256_hex(diff.as_bytes());
-        if &current_hash != pre_hash {
-            return Err(OrchestratorError::ReviewerProtocolViolation {
-                detail: "reviewer mutated tracked file content (git diff HEAD changed)".to_owned(),
-            });
-        }
-    }
-
-    if let Some(pre_hash) = &ctx.pre_reviewer_untracked_hash {
-        let current_hash = hash_untracked_files(ctx.repo(), &outbox_rel).await?;
-        if &current_hash != pre_hash {
-            return Err(OrchestratorError::ReviewerProtocolViolation {
-                detail: "reviewer mutated untracked file content".to_owned(),
-            });
-        }
-    }
-
-    Ok(())
+    Ok(reviewer_workspace_dirty_lines(initial, &current_status, &outbox_rel).map(|lines| {
+        format!(
+            "reviewer left dirty worktree entries after review; clean by committing or reverting before writing final YAML: {}",
+            lines.join("; ")
+        )
+    }))
 }
 
-/// Pure inner logic of [`check_reviewer_git_state`]; extracted for unit testing.
+/// Pure inner logic of [`reviewer_workspace_dirty_reason`]; extracted for unit testing.
 ///
 /// Compares `initial` and `current` git-status outputs (each a newline-separated
-/// list of `git status --short` lines) and returns an error for any new line whose
+/// list of `git status --short` lines) and returns any new lines whose
 /// path is not `outbox_rel`.
-fn check_reviewer_git_state_lines(
+fn reviewer_workspace_dirty_lines(
     initial: &str,
     current: &str,
     outbox_rel: &str,
-) -> OrchestratorResult<()> {
+) -> Option<Vec<String>> {
     let initial_lines: std::collections::HashSet<&str> = initial.lines().collect();
-    let dirty_lines: Vec<&str> = current
+    let dirty_lines: Vec<String> = current
         .lines()
         .filter(|l| !initial_lines.contains(l))
+        .filter(|line| {
+            // `git status --short` format: "XY path" — 2 status chars + space + path.
+            let path_part = if line.len() > 3 {
+                line[3..].trim()
+            } else {
+                line.trim()
+            };
+            path_part != outbox_rel
+        })
+        .map(str::to_owned)
         .collect();
 
-    for line in dirty_lines {
-        // `git status --short` format: "XY path" — 2 status chars + space + path.
-        let path_part = if line.len() > 3 {
-            line[3..].trim()
-        } else {
-            line.trim()
-        };
-        if path_part != outbox_rel {
-            return Err(OrchestratorError::ReviewerProtocolViolation {
-                detail: format!("reviewer mutated repository: {line}"),
-            });
-        }
+    if dirty_lines.is_empty() {
+        None
+    } else {
+        Some(dirty_lines)
     }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,29 +1191,6 @@ fn log_transport_snapshot(label: &str, snapshot: &TransportBodyReport) {
     tracing::info!("{label} body begin\n{}\n{label} body end", snapshot.body);
 }
 
-/// Compute a content hash over all untracked files in the repo, excluding `outbox_rel`.
-///
-/// Enumerates files via `git ls-files --others --exclude-standard`, sorts the list for
-/// determinism, then concatenates each relative path followed by its contents.
-async fn hash_untracked_files(
-    repo: &std::path::Path,
-    outbox_rel: &str,
-) -> OrchestratorResult<String> {
-    let stdout = run_git(repo, &["ls-files", "--others", "--exclude-standard"]).await?;
-    let mut files: Vec<&str> = stdout.lines().filter(|f| *f != outbox_rel).collect();
-    files.sort_unstable();
-    let mut buf: Vec<u8> = Vec::new();
-    for file in files {
-        buf.extend_from_slice(file.as_bytes());
-        buf.push(b'\n');
-        let path = repo.join(file);
-        let content = tokio::fs::read(&path).await?;
-        buf.extend_from_slice(&content);
-        buf.push(b'\n');
-    }
-    Ok(crate::transport::sha256_hex(&buf))
-}
-
 async fn phase_separator_wait() {
     tokio::time::sleep(std::time::Duration::from_secs(PHASE_SEPARATOR_WAIT_SEC)).await;
 }
@@ -1146,72 +1258,15 @@ mod tests {
         assert!(snapshot.is_none());
     }
 
-    #[tokio::test]
-    async fn hash_untracked_files_changes_on_content_change() {
-        let dir = tempfile::tempdir().unwrap();
-        // Minimal git repo so git ls-files works.
-        tokio::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .await
-            .unwrap();
-
-        let file = dir.path().join("PLAN.md");
-        tokio::fs::write(&file, b"initial").await.unwrap();
-
-        let outbox = ".agent-io/outbox.txt";
-        let hash1 = hash_untracked_files(dir.path(), outbox).await.unwrap();
-        assert!(!hash1.is_empty());
-
-        tokio::fs::write(&file, b"modified").await.unwrap();
-        let hash2 = hash_untracked_files(dir.path(), outbox).await.unwrap();
-
-        assert_ne!(hash1, hash2);
-    }
-
-    #[tokio::test]
-    async fn hash_untracked_files_excludes_outbox() {
-        let dir = tempfile::tempdir().unwrap();
-        tokio::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .await
-            .unwrap();
-
-        // Create a file that matches outbox_rel and a regular untracked file.
-        let outbox_rel = ".agent-io/outbox.txt";
-        tokio::fs::create_dir_all(dir.path().join(".agent-io"))
-            .await
-            .unwrap();
-        tokio::fs::write(dir.path().join(outbox_rel), b"verdict")
-            .await
-            .unwrap();
-        tokio::fs::write(dir.path().join("PLAN.md"), b"plan")
-            .await
-            .unwrap();
-
-        let hash_with_outbox = hash_untracked_files(dir.path(), outbox_rel).await.unwrap();
-
-        // Changing outbox content must not change the hash.
-        tokio::fs::write(dir.path().join(outbox_rel), b"different verdict")
-            .await
-            .unwrap();
-        let hash_after_outbox_change = hash_untracked_files(dir.path(), outbox_rel).await.unwrap();
-
-        assert_eq!(hash_with_outbox, hash_after_outbox_change);
-    }
-
     #[test]
     fn reviewer_git_state_no_new_lines_is_ok() {
         let status = " M src/foo.rs\n?? bar.txt";
-        assert!(check_reviewer_git_state_lines(status, status, &outbox_rel()).is_ok());
+        assert!(reviewer_workspace_dirty_lines(status, status, &outbox_rel()).is_none());
     }
 
     #[test]
     fn reviewer_git_state_empty_both_is_ok() {
-        assert!(check_reviewer_git_state_lines("", "", &outbox_rel()).is_ok());
+        assert!(reviewer_workspace_dirty_lines("", "", &outbox_rel()).is_none());
     }
 
     #[test]
@@ -1219,24 +1274,23 @@ mod tests {
         let outbox = outbox_rel();
         // "??" = untracked in git status --short; 3rd char is space before path
         let current = format!("?? {outbox}");
-        assert!(check_reviewer_git_state_lines("", &current, &outbox).is_ok());
+        assert!(reviewer_workspace_dirty_lines("", &current, &outbox).is_none());
     }
 
     #[test]
     fn reviewer_git_state_extra_file_is_violation() {
-        let result = check_reviewer_git_state_lines("", " M src/lib.rs", &outbox_rel());
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reviewer mutated repository"));
+        let result = reviewer_workspace_dirty_lines("", " M src/lib.rs", &outbox_rel()).unwrap();
+        assert_eq!(result, vec![" M src/lib.rs"]);
     }
 
     #[test]
     fn reviewer_git_state_outbox_and_extra_file_is_violation() {
         let outbox = outbox_rel();
         let current = format!("?? {outbox}\n M src/lib.rs");
-        assert!(check_reviewer_git_state_lines("", &current, &outbox).is_err());
+        assert_eq!(
+            reviewer_workspace_dirty_lines("", &current, &outbox).unwrap(),
+            vec![" M src/lib.rs"]
+        );
     }
 
     #[test]
@@ -1244,14 +1298,17 @@ mod tests {
         // Executor left PLAN.md; it appears in both initial and current — not a violation.
         let initial = " M PLAN.md";
         let current = " M PLAN.md";
-        assert!(check_reviewer_git_state_lines(initial, current, &outbox_rel()).is_ok());
+        assert!(reviewer_workspace_dirty_lines(initial, current, &outbox_rel()).is_none());
     }
 
     #[test]
     fn reviewer_git_state_new_file_beyond_initial_is_violation() {
         let initial = " M PLAN.md";
         let current = " M PLAN.md\n M README.md";
-        assert!(check_reviewer_git_state_lines(initial, current, &outbox_rel()).is_err());
+        assert_eq!(
+            reviewer_workspace_dirty_lines(initial, current, &outbox_rel()).unwrap(),
+            vec![" M README.md"]
+        );
     }
 
     fn make_validate_ctx(workspace_root: std::path::PathBuf) -> OrchestratorCtx {
@@ -1270,6 +1327,75 @@ mod tests {
         })
     }
 
+    async fn git(repo: &Path, args: &[&str]) -> String {
+        let output = tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    async fn init_git_repo_with_commit() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init"]).await;
+        git(
+            dir.path(),
+            &["config", "user.email", "orchestrator-test@example.com"],
+        )
+        .await;
+        git(dir.path(), &["config", "user.name", "Orchestrator Test"]).await;
+        tokio::fs::write(dir.path().join("README.md"), "initial\n")
+            .await
+            .unwrap();
+        git(dir.path(), &["add", "README.md"]).await;
+        git(dir.path(), &["commit", "-m", "initial"]).await;
+        dir
+    }
+
+    fn invalid_input_reason(err: OrchestratorError) -> String {
+        match err {
+            OrchestratorError::InvalidInput { reason, .. } => reason,
+            err => panic!("expected InvalidInput, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn reset_attempt_git_telemetry_clears_stale_hot_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = make_validate_ctx(dir.path().to_path_buf());
+        ctx.dirty_file_touch_counts
+            .insert("README.md".to_owned(), 4);
+        ctx.committed_file_touch_counts
+            .insert("CONTRIBUTING.md".to_owned(), 1);
+        ctx.last_dirty_files_count = 3;
+        ctx.committed_files_seen_count = 31;
+
+        reset_attempt_git_telemetry(&mut ctx, 0);
+
+        assert!(ctx.dirty_file_touch_counts.is_empty());
+        assert!(ctx.committed_file_touch_counts.is_empty());
+        assert_eq!(ctx.last_dirty_files_count, 0);
+        assert_eq!(ctx.committed_files_seen_count, 0);
+    }
+
+    #[test]
+    fn git_status_line_set_uses_dispatch_status_as_delta_baseline() {
+        let lines = git_status_line_set(" M README.md\n?? new.txt\n\n");
+
+        assert_eq!(
+            lines,
+            BTreeSet::from([" M README.md".to_owned(), "?? new.txt".to_owned()])
+        );
+    }
+
     #[test]
     fn validate_inputs_resolves_relative_path() {
         let cwd = std::env::current_dir().unwrap();
@@ -1285,18 +1411,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_branch_name_supports_unborn_repo() {
+    async fn context_prep_rejects_unborn_repo() {
         let dir = tempfile::tempdir().unwrap();
-        tokio::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .await
-            .unwrap();
+        git(dir.path(), &["init"]).await;
 
-        let branch = current_branch_name(dir.path()).await.unwrap();
-        assert!(!branch.trim().is_empty());
-        assert_ne!(branch, "HEAD");
+        let mut ctx = make_validate_ctx(dir.path().to_path_buf());
+        let reason = invalid_input_reason(do_context_prep(&mut ctx).await.unwrap_err());
+
+        assert!(reason.contains("valid HEAD commit"), "{reason}");
+        assert!(
+            reason.contains("unborn branches are unsupported"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_prep_rejects_detached_head() {
+        let dir = init_git_repo_with_commit().await;
+        git(dir.path(), &["checkout", "--detach", "HEAD"]).await;
+
+        let mut ctx = make_validate_ctx(dir.path().to_path_buf());
+        let reason = invalid_input_reason(do_context_prep(&mut ctx).await.unwrap_err());
+
+        assert!(reason.contains("detached HEAD"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn context_prep_rejects_non_top_level_workspace_root() {
+        let dir = init_git_repo_with_commit().await;
+        let subdir = dir.path().join("nested");
+        tokio::fs::create_dir(&subdir).await.unwrap();
+
+        let mut ctx = make_validate_ctx(subdir);
+        let reason = invalid_input_reason(do_context_prep(&mut ctx).await.unwrap_err());
+
+        assert!(reason.contains("git repository top-level"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn context_prep_rejects_git_operation_in_progress() {
+        let dir = init_git_repo_with_commit().await;
+        let merge_head = resolve_git_path(dir.path(), "MERGE_HEAD").await.unwrap();
+        tokio::fs::write(&merge_head, "deadbeef\n").await.unwrap();
+
+        let mut ctx = make_validate_ctx(dir.path().to_path_buf());
+        let reason = invalid_input_reason(do_context_prep(&mut ctx).await.unwrap_err());
+
+        assert!(
+            reason.contains("git operation in progress: merge"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_prep_rejects_git_lock_file() {
+        let dir = init_git_repo_with_commit().await;
+        let index_lock = resolve_git_path(dir.path(), "index.lock").await.unwrap();
+        tokio::fs::write(&index_lock, "").await.unwrap();
+
+        let mut ctx = make_validate_ctx(dir.path().to_path_buf());
+        let reason = invalid_input_reason(do_context_prep(&mut ctx).await.unwrap_err());
+
+        assert!(reason.contains("git lock file exists"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn validate_no_unmerged_index_rejects_conflicted_entries() {
+        let dir = init_git_repo_with_commit().await;
+        let base = git(dir.path(), &["hash-object", "-w", "--stdin"])
+            .await
+            .trim()
+            .to_owned();
+        let ours = git(dir.path(), &["hash-object", "-w", "--stdin"])
+            .await
+            .trim()
+            .to_owned();
+        let theirs = git(dir.path(), &["hash-object", "-w", "--stdin"])
+            .await
+            .trim()
+            .to_owned();
+        let index_info = format!(
+            "100644 {base} 1\tconflict.txt\n100644 {ours} 2\tconflict.txt\n100644 {theirs} 3\tconflict.txt\n"
+        );
+        let mut child = tokio::process::Command::new("git")
+            .args(["update-index", "--index-info"])
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use tokio::io::AsyncWriteExt;
+
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(index_info.as_bytes()).await.unwrap();
+        }
+        let output = child.wait_with_output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "git update-index failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let reason =
+            invalid_input_reason(validate_no_unmerged_index(dir.path()).await.unwrap_err());
+
+        assert!(reason.contains("unmerged/conflicted entries"), "{reason}");
     }
 
     #[test]
@@ -1469,6 +1688,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reviewer_output_collect_dirty_workspace_routes_cleanup_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        let transport = dir.path().join(crate::constants::TRANSPORT_DIR);
+        tokio::fs::create_dir_all(&transport).await.unwrap();
+        let yaml = r#"
+quality_score: 8
+decision: accept
+rationale: ok
+contract_satisfied: true
+hard_blockers_present: false
+notion_requirements_satisfied: true
+feedback_for_executor: []
+checks_performed: []
+findings: []
+verification_commands: []
+blocking_reason: null
+irreconcilable_reason: null
+poisoned_session_reason: null
+"#;
+        tokio::fs::write(transport.join(crate::constants::OUTBOX_FILE), yaml)
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("reviewer-leftover.txt"), "dirty")
+            .await
+            .unwrap();
+
+        let mut ctx = test_ctx(dir.path());
+
+        do_reviewer_output_collect(&mut ctx).await.unwrap();
+
+        assert_eq!(ctx.run_state, RunState::RoundRetryDecide);
+        assert_eq!(ctx.consecutive_failure_count, 1);
+        assert!(ctx.review_result.is_some());
+        assert!(ctx.review_result_yaml_raw.is_some());
+        assert!(ctx.reviewer_workspace_rejection.is_some());
+        assert!(ctx
+            .failures
+            .last()
+            .unwrap()
+            .contains("reviewer workspace cleanup required"));
+    }
+
+    #[tokio::test]
     async fn reviewer_output_collect_rejects_accept_when_required_notion_not_satisfied() {
         let dir = tempfile::tempdir().unwrap();
         tokio::process::Command::new("git")
@@ -1510,5 +1778,37 @@ poisoned_session_reason: null
             .last()
             .unwrap()
             .contains("decision=accept is forbidden"));
+    }
+
+    #[tokio::test]
+    async fn orch_verify_clears_previous_reviewer_verdict_before_next_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(dir.path());
+        ctx.review_result_yaml_raw = Some("quality_score: 5\ndecision: revise\n".to_owned());
+        ctx.review_result = Some(crate::yaml_check::ReviewerYaml {
+            quality_score: 5.0,
+            decision: ReviewDecision::Revise,
+            rationale: "old revise".to_owned(),
+            contract_satisfied: false,
+            hard_blockers_present: true,
+            notion_requirements_satisfied: Some(true),
+            feedback_for_executor: vec!["fix it".to_owned()],
+            checks_performed: None,
+            findings: None,
+            verification_commands: None,
+            blocking_reason: None,
+            irreconcilable_reason: None,
+            poisoned_session_reason: None,
+        });
+        ctx.reviewer_yaml_rejection = Some("old yaml rejection".to_owned());
+        ctx.reviewer_workspace_rejection = Some("old workspace rejection".to_owned());
+
+        do_orch_verify(&mut ctx).await.unwrap();
+
+        assert_eq!(ctx.run_state, RunState::ReviewerDispatch);
+        assert!(ctx.review_result.is_none());
+        assert!(ctx.review_result_yaml_raw.is_none());
+        assert!(ctx.reviewer_yaml_rejection.is_none());
+        assert!(ctx.reviewer_workspace_rejection.is_none());
     }
 }

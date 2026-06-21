@@ -256,7 +256,7 @@ poisoned_session_reason: null
     const MINIMAL_REVISE: &str = r#"
 quality_score: 5.0
 decision: revise
-rationale: Changes are needed
+rationale: Changes needed
 contract_satisfied: false
 hard_blockers_present: false
 notion_requirements_satisfied: true

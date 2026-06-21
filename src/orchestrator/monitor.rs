@@ -58,6 +58,64 @@ fn git_status_lines(raw: &str) -> BTreeSet<String> {
         .collect()
 }
 
+fn parse_git_name_status_path(line: &str) -> Option<String> {
+    let line = line.trim_end();
+    if line.trim().is_empty() {
+        return None;
+    }
+
+    let mut tab_parts = line.split('\t');
+    let first = tab_parts.next()?.trim();
+    let rest = tab_parts.collect::<Vec<_>>();
+    if !rest.is_empty() {
+        return rest.last().map(|part| part.trim().to_owned());
+    }
+
+    let mut parts = line.split_whitespace().collect::<Vec<_>>();
+    if parts.len() >= 2 {
+        return Some(parts.pop()?.trim().to_owned());
+    }
+    if first.is_empty() {
+        return None;
+    }
+    Some(first.to_owned())
+}
+
+fn format_git_name_status_line(line: &str) -> Option<String> {
+    let line = line.trim_end();
+    if line.trim().is_empty() {
+        return None;
+    }
+
+    let mut tab_parts = line.split('\t');
+    let status = tab_parts.next()?.trim();
+    let paths = tab_parts
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    if !paths.is_empty() {
+        return Some(format!("{status} {}", paths.join(" -> ")));
+    }
+
+    if let Some((status, path)) = line.split_once(' ') {
+        let status = status.trim();
+        let path = path.trim();
+        if !status.is_empty() && !path.is_empty() {
+            return Some(format!("{status} {}", path.replace('\t', " ")));
+        }
+    }
+
+    Some(line.replace('\t', " "))
+}
+
+fn git_name_status_lines(raw: &str) -> BTreeSet<String> {
+    raw.lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn top_hot_files(
     counts: &std::collections::HashMap<String, u32>,
     limit: usize,
@@ -71,6 +129,18 @@ fn top_hot_files(
     items
 }
 
+fn truncate_at_char_boundary(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+
+    let mut new_len = max_bytes;
+    while !value.is_char_boundary(new_len) {
+        new_len -= 1;
+    }
+    value.truncate(new_len);
+}
+
 fn normalize_provider_action(raw: &str) -> Option<String> {
     let action = raw.trim();
     if action.is_empty() {
@@ -80,7 +150,7 @@ fn normalize_provider_action(raw: &str) -> Option<String> {
     let action = action.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut action = action.trim().to_owned();
     if action.len() > 220 {
-        action.truncate(220);
+        truncate_at_char_boundary(&mut action, 220);
         action.push_str("...");
     }
     Some(action)
@@ -231,6 +301,19 @@ pub(super) async fn do_monitor(
         ctx.artifact_map = signals.artifact_map.clone();
         let git_lines = git_status_lines(&signals.git_status_short);
 
+        let attempt = ctx.attempt.as_ref().unwrap();
+        let git_changed = signals.git_status_hash != attempt.prev_probe_git_status_hash;
+        // A new commit cleans up the worktree so git_status_hash can return to the dispatch
+        // baseline; detect committed changes separately via HEAD movement.
+        let git_committed = signals.git_head_hash != attempt.prev_probe_git_head_hash;
+        let prev_probe_git_head_hash = attempt.prev_probe_git_head_hash.clone();
+        let outbox_changed = signals.outbox_meta != attempt.prev_probe_outbox_meta;
+        let log_changed = match (signals.provider_log_mtime, attempt.prev_probe_log_mtime) {
+            (Some(curr), Some(prev)) => curr != prev,
+            (Some(_), None) => true,
+            _ => false,
+        };
+
         // Determine if any work signal changed since the previous probe cycle.
         // `process_alive` is deliberately excluded: it is a liveness signal, not an activity
         // signal. Including it would reset `last_work_signal_ts` every cycle and prevent
@@ -240,24 +323,11 @@ pub(super) async fn do_monitor(
         // make, pytest) are active work signals that suppress hang detection during build/test
         // phases. The `hang_max_with_work_signals_exceeded` ceiling still fires after 30 min
         // even when children are alive, guarding against perpetually-hung child processes.
-        let work_signals_changed = {
-            let attempt = ctx.attempt.as_ref().unwrap();
-            let git_changed = signals.git_status_hash != attempt.prev_probe_git_status_hash;
-            // A new commit cleans up the worktree so git_status_hash reverts to the dispatch
-            // baseline; detect it separately via HEAD movement.
-            let git_committed = signals.git_head_hash != attempt.prev_probe_git_head_hash;
-            let outbox_changed = signals.outbox_meta != attempt.prev_probe_outbox_meta;
-            let log_changed = match (signals.provider_log_mtime, attempt.prev_probe_log_mtime) {
-                (Some(curr), Some(prev)) => curr != prev,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            git_changed
-                || git_committed
-                || outbox_changed
-                || log_changed
-                || signals.has_child_processes
-        };
+        let work_signals_changed = git_changed
+            || git_committed
+            || outbox_changed
+            || log_changed
+            || signals.has_child_processes;
 
         let (newly_changed, resolved, touched_paths) = {
             let attempt = ctx.attempt.as_ref().unwrap();
@@ -280,15 +350,47 @@ pub(super) async fn do_monitor(
 
         if !newly_changed.is_empty() || !resolved.is_empty() {
             for path in &touched_paths {
-                let c = ctx.file_touch_counts.entry(path.clone()).or_insert(0);
+                let c = ctx.dirty_file_touch_counts.entry(path.clone()).or_insert(0);
                 *c += 1;
             }
-            let hot = top_hot_files(&ctx.file_touch_counts, 3);
+            let hot = top_hot_files(&ctx.dirty_file_touch_counts, 3);
             tracing::info!(
-                "git-delta: role={role:?} newly_changed={:?} resolved={:?} hot_files={:?}",
+                "git-delta: role={role:?} newly_changed={:?} resolved={:?} dirty_hot_files={:?}",
                 newly_changed,
                 resolved,
                 hot
+            );
+        }
+
+        if git_committed {
+            let commit_range = format!("{}..{}", prev_probe_git_head_hash, signals.git_head_hash);
+            let raw =
+                crate::sessions::run_git(ctx.repo(), &["diff", "--name-status", &commit_range])
+                    .await?;
+            let committed_lines = git_name_status_lines(&raw);
+            let committed_display_lines = committed_lines
+                .iter()
+                .filter_map(|line| format_git_name_status_line(line))
+                .collect::<Vec<_>>();
+            let committed_paths = committed_lines
+                .iter()
+                .filter_map(|line| parse_git_name_status_path(line))
+                .collect::<Vec<_>>();
+            for path in &committed_paths {
+                let c = ctx
+                    .committed_file_touch_counts
+                    .entry(path.clone())
+                    .or_insert(0);
+                *c += 1;
+            }
+            ctx.committed_files_seen_count = ctx.committed_file_touch_counts.len();
+            let committed_hot = top_hot_files(&ctx.committed_file_touch_counts, 3);
+            tracing::info!(
+                "git-commit-delta: role={role:?} old_head={} new_head={} committed={:?} committed_hot_files={:?}",
+                prev_probe_git_head_hash,
+                signals.git_head_hash,
+                committed_display_lines,
+                committed_hot
             );
         }
 
@@ -314,7 +416,7 @@ pub(super) async fn do_monitor(
                 attempt.provider_log_ever_seen = true;
             }
         }
-        ctx.last_changed_files_count = git_lines.len();
+        ctx.last_dirty_files_count = git_lines.len();
 
         let dispatch_ts = ctx.attempt.as_ref().map(|a| a.dispatch_ts).unwrap_or(now);
         let hang_max_exceeded =
@@ -465,13 +567,17 @@ pub(super) async fn do_monitor(
                 .map(|t| (now - t).num_seconds().max(0))
                 .unwrap_or(0);
             let phase_hint = ctx.last_phase_hint.as_deref().unwrap_or("unknown_phase");
-            let hot = top_hot_files(&ctx.file_touch_counts, 3);
+            let dirty_hot = top_hot_files(&ctx.dirty_file_touch_counts, 3);
+            let committed_hot = top_hot_files(&ctx.committed_file_touch_counts, 3);
             tracing::info!(
                 "heartbeat: role={role:?} state={attempt_state:?} \
                  last_signal={stale_secs}s ago provider_stale={provider_stale} \
-                 phase_hint={phase_hint} changed_files={} hot_files={:?}",
-                ctx.last_changed_files_count,
-                hot
+                 phase_hint={phase_hint} dirty_files={} committed_files={} \
+                 dirty_hot_files={:?} committed_hot_files={:?}",
+                ctx.last_dirty_files_count,
+                ctx.committed_files_seen_count,
+                dirty_hot,
+                committed_hot
             );
             if let (Some(cmd), Some(ts)) = (&ctx.last_provider_action, ctx.last_provider_action_ts)
             {
@@ -970,6 +1076,52 @@ mod tests {
         assert!(lines.contains(" M PLAN.md"));
         assert!(lines.contains("?? NEW.md"));
         assert!(!lines.contains("M PLAN.md"));
+    }
+
+    #[test]
+    fn parse_git_name_status_path_handles_standard_name_status() {
+        assert_eq!(
+            parse_git_name_status_path("A\tPLAN.md").as_deref(),
+            Some("PLAN.md")
+        );
+        assert_eq!(
+            parse_git_name_status_path("M\tmodules/app.rs").as_deref(),
+            Some("modules/app.rs")
+        );
+        assert_eq!(
+            parse_git_name_status_path("D\told.md").as_deref(),
+            Some("old.md")
+        );
+    }
+
+    #[test]
+    fn parse_git_name_status_path_handles_rename_name_status() {
+        assert_eq!(
+            parse_git_name_status_path("R100\told.md\tnew.md").as_deref(),
+            Some("new.md")
+        );
+    }
+
+    #[test]
+    fn format_git_name_status_line_removes_raw_tabs() {
+        let added = format_git_name_status_line("A\tdrone_city_nav/src/grid_overlay.cpp")
+            .expect("line should format");
+        assert_eq!(added, "A drone_city_nav/src/grid_overlay.cpp");
+        assert!(!added.contains('\t'));
+
+        let renamed = format_git_name_status_line("R100\told name.md\tnew name.md")
+            .expect("line should format");
+        assert_eq!(renamed, "R100 old name.md -> new name.md");
+        assert!(!renamed.contains('\t'));
+    }
+
+    #[test]
+    fn normalize_provider_action_truncates_utf8_safely() {
+        let raw = format!("{}é", "a".repeat(219));
+
+        let action = normalize_provider_action(&raw).unwrap();
+
+        assert_eq!(action, format!("{}...", "a".repeat(219)));
     }
 
     #[test]

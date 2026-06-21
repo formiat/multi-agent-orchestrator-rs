@@ -180,11 +180,6 @@ fn build_systemd_run_args(unit: &str, opencode_args: &[String]) -> Vec<String> {
         SYSTEMD_MEMORY_MAX.to_owned(),
         "-p".to_owned(),
         SYSTEMD_MEMORY_SWAP_MAX.to_owned(),
-        format!(
-            "--setenv={}={}",
-            super::PROPTEST_DISABLE_FAILURE_PERSISTENCE_ENV.0,
-            super::PROPTEST_DISABLE_FAILURE_PERSISTENCE_ENV.1
-        ),
         "opencode".to_owned(),
     ];
     args.extend(opencode_args.iter().cloned());
@@ -462,11 +457,6 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|w| w[0] == "-p" && w[1] == SYSTEMD_MEMORY_SWAP_MAX));
-        assert!(args.contains(&format!(
-            "--setenv={}={}",
-            crate::providers::PROPTEST_DISABLE_FAILURE_PERSISTENCE_ENV.0,
-            crate::providers::PROPTEST_DISABLE_FAILURE_PERSISTENCE_ENV.1
-        )));
 
         let opencode_pos = args.iter().position(|x| x == "opencode").unwrap();
         assert_eq!(&args[opencode_pos + 1..], opencode_args.as_slice());

@@ -76,19 +76,9 @@ pub struct OrchestratorCtx {
 
     // --- Context bundle (set during CONTEXT_PREP) ---
     pub branch: String,
-    /// Git status captured immediately before reviewer dispatch; used as baseline in
-    /// `check_reviewer_git_state` to detect reviewer-introduced mutations.
+    /// Git status captured before the first reviewer dispatch; used as baseline when asking
+    /// reviewer cleanup retries to remove newly-left dirty worktree entries.
     pub pre_reviewer_git_status: Option<String>,
-    /// SHA-256 of `git diff HEAD` captured immediately before reviewer dispatch.
-    ///
-    /// Detects content changes to files that were already dirty before reviewer ran —
-    /// those files have identical `git status --short` lines before and after, so
-    /// status-line comparison alone misses the mutation.
-    pub pre_reviewer_git_diff_hash: Option<String>,
-    /// SHA-256 of all untracked-file contents (excluding outbox) captured immediately before
-    /// reviewer dispatch. Detects content changes to untracked files, which `git diff HEAD`
-    /// and status-line comparison both miss (status stays `??` before and after).
-    pub pre_reviewer_untracked_hash: Option<String>,
     /// Commit SHA captured at CONTEXT_PREP; used to build `initial_head..HEAD` ranges.
     pub initial_git_head: Option<String>,
     pub claude_project_key: Option<String>,
@@ -113,6 +103,7 @@ pub struct OrchestratorCtx {
     pub review_result: Option<ReviewerYaml>,
     pub review_result_yaml_raw: Option<String>,
     pub reviewer_yaml_rejection: Option<String>,
+    pub reviewer_workspace_rejection: Option<String>,
 
     // --- Transport diagnostics ---
     pub last_inbox_snapshot: Option<TransportBodyReport>,
@@ -124,12 +115,16 @@ pub struct OrchestratorCtx {
     pub artifact_paths: Vec<String>,
     pub warnings: Vec<String>,
     pub failures: Vec<String>,
-    /// key: repository path from `git status --short`; value: number of probe deltas that touched it.
-    pub file_touch_counts: HashMap<String, u32>,
+    /// key: repository path from `git status --short`; value: number of dirty-worktree deltas that touched it.
+    pub dirty_file_touch_counts: HashMap<String, u32>,
+    /// key: repository path from committed git diffs; value: number of commit deltas that touched it.
+    pub committed_file_touch_counts: HashMap<String, u32>,
     /// Last coarse phase hint derived from deterministic probe signals.
     pub last_phase_hint: Option<String>,
-    /// Number of currently changed files from the latest probe.
-    pub last_changed_files_count: usize,
+    /// Number of currently dirty files from the latest `git status --short` probe.
+    pub last_dirty_files_count: usize,
+    /// Number of distinct committed files observed since dispatch.
+    pub committed_files_seen_count: usize,
     /// Last observed provider-side command (from stdout/stderr diagnostics tail).
     pub last_provider_action: Option<String>,
     /// Timestamp when `last_provider_action` was first observed.
@@ -147,8 +142,6 @@ impl OrchestratorCtx {
             current_role: None,
             branch: String::new(),
             pre_reviewer_git_status: None,
-            pre_reviewer_git_diff_hash: None,
-            pre_reviewer_untracked_hash: None,
             initial_git_head: None,
             claude_project_key: None,
             executor_session_id: None,
@@ -162,6 +155,7 @@ impl OrchestratorCtx {
             review_result: None,
             review_result_yaml_raw: None,
             reviewer_yaml_rejection: None,
+            reviewer_workspace_rejection: None,
             last_inbox_snapshot: None,
             executor_outbox_snapshot: None,
             reviewer_outbox_snapshot: None,
@@ -169,9 +163,11 @@ impl OrchestratorCtx {
             artifact_paths: Vec::new(),
             warnings: Vec::new(),
             failures: Vec::new(),
-            file_touch_counts: HashMap::new(),
+            dirty_file_touch_counts: HashMap::new(),
+            committed_file_touch_counts: HashMap::new(),
             last_phase_hint: None,
-            last_changed_files_count: 0,
+            last_dirty_files_count: 0,
+            committed_files_seen_count: 0,
             last_provider_action: None,
             last_provider_action_ts: None,
             detail: None,
@@ -298,7 +294,6 @@ fn error_to_run_state(err: &OrchestratorError) -> RunState {
         OrchestratorError::SessionBindFailed { .. } => RunState::RunFailedSessionBind,
         OrchestratorError::SessionLocked { .. } => RunState::RunFailedSessionLocked,
         OrchestratorError::ArtifactContract { .. } => RunState::RunFailedProtocol,
-        OrchestratorError::ReviewerProtocolViolation { .. } => RunState::RunFailedProtocol,
         // Io, CommandFailed, TransportResetFailed, RequestChangedAbortRetry are infrastructure
         // failures unrelated to agent protocol.
         _ => RunState::RunFailedInternal,
@@ -375,14 +370,6 @@ mod tests {
     fn error_to_run_state_artifact_contract() {
         let e = OrchestratorError::ArtifactContract {
             contract: "PLAN.md missing".to_owned(),
-        };
-        assert_eq!(error_to_run_state(&e), RunState::RunFailedProtocol);
-    }
-
-    #[test]
-    fn error_to_run_state_reviewer_protocol_violation() {
-        let e = OrchestratorError::ReviewerProtocolViolation {
-            detail: "mutated repo".to_owned(),
         };
         assert_eq!(error_to_run_state(&e), RunState::RunFailedProtocol);
     }

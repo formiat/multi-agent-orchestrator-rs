@@ -61,9 +61,6 @@ pub enum OrchestratorError {
 
     #[error("request payload changed before retry — aborting retry")]
     RequestChangedAbortRetry,
-
-    #[error("reviewer protocol violation: {detail}")]
-    ReviewerProtocolViolation { detail: String },
 }
 
 /// Top-level result type for all public orchestrator functions.

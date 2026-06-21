@@ -23,7 +23,7 @@ use crate::state::{NotionPolicy, ProviderKind, RemoteNetworkPolicy, WorkflowType
 #[derive(Parser, Debug)]
 #[command(name = "orchestrate", version, about)]
 struct Cli {
-    /// Workflow type: plan | investigate | implement
+    /// Workflow type: plan | investigate (alias: inv) | implement (alias: impl)
     #[arg(short = 'w', long)]
     workflow: WorkflowType,
 

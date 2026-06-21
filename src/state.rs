@@ -199,10 +199,10 @@ impl std::str::FromStr for WorkflowType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "plan" => Ok(Self::Plan),
-            "investigate" => Ok(Self::Investigate),
-            "implement" => Ok(Self::Implement),
+            "investigate" | "inv" => Ok(Self::Investigate),
+            "implement" | "impl" => Ok(Self::Implement),
             other => Err(format!(
-                "unknown workflow '{other}'; expected plan|investigate|implement"
+                "unknown workflow '{other}'; expected plan|investigate|inv|implement|impl"
             )),
         }
     }
@@ -298,6 +298,7 @@ pub enum TemplateId {
     ExecutorInitial,
     ReviewerReview,
     ReviewerRepairYaml,
+    ReviewerRepairWorkspace,
     ExecutorFeedback,
 }
 
@@ -494,6 +495,7 @@ pub struct ProbeSignals {
 
 /// Placeholder values for fixed prompt template substitution.
 pub struct TemplateValues {
+    pub provider: ProviderKind,
     pub workflow_type: WorkflowType,
     pub workspace_root: String,
     pub transport_dir: String,
@@ -512,12 +514,12 @@ pub struct TemplateValues {
     pub reviewer_yaml_schema: Option<String>,
     /// Exact parser/validator error from the previous rejected reviewer YAML.
     pub reviewer_yaml_rejection: Option<String>,
+    /// Dirty-worktree reason after the previous reviewer attempt.
+    pub reviewer_workspace_rejection: Option<String>,
     /// Raw YAML from the previous reviewer round (feedback template only).
     pub review_result_yaml: Option<String>,
     /// Numbered feedback items for the executor (feedback template only).
     pub feedback_for_executor: Option<String>,
-    /// Optional executor-only local run wrapper instruction.
-    pub runlim_rule: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +569,36 @@ mod tests {
             RemoteNetworkPolicy::Operational
         );
         assert!("allowed".parse::<RemoteNetworkPolicy>().is_err());
+    }
+
+    #[test]
+    fn workflow_type_parses_canonical_names_and_aliases() {
+        assert_eq!("plan".parse::<WorkflowType>().unwrap(), WorkflowType::Plan);
+        assert_eq!(
+            "investigate".parse::<WorkflowType>().unwrap(),
+            WorkflowType::Investigate
+        );
+        assert_eq!(
+            "inv".parse::<WorkflowType>().unwrap(),
+            WorkflowType::Investigate
+        );
+        assert_eq!(
+            "implement".parse::<WorkflowType>().unwrap(),
+            WorkflowType::Implement
+        );
+        assert_eq!(
+            "impl".parse::<WorkflowType>().unwrap(),
+            WorkflowType::Implement
+        );
+
+        assert!("review".parse::<WorkflowType>().is_err());
+    }
+
+    #[test]
+    fn workflow_type_display_uses_canonical_names() {
+        assert_eq!(WorkflowType::Plan.to_string(), "plan");
+        assert_eq!(WorkflowType::Investigate.to_string(), "investigate");
+        assert_eq!(WorkflowType::Implement.to_string(), "implement");
     }
 
     #[test]
